@@ -1,0 +1,12 @@
+services:
+  virtual-hypercore:
+    build: .
+    ports:
+      - "3010:3010"
+    environment:
+      PORT: "3010"
+      NODE_ENV: "production"
+      ANVIL_RPC_URL: "http://host.docker.internal:8545"
+      SYMBOLS: "ETH-USD,BTC-USD,SOL-USD"
+    volumes:
+      - ./data:/app/data
