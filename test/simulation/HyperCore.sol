@@ -4,9 +4,71 @@ pragma solidity ^0.8.28;
 import {CoreExecution} from "./hyper-core/CoreExecution.sol";
 import {DoubleEndedQueue} from "@openzeppelin/contracts/utils/structs/DoubleEndedQueue.sol";
 import {HLConstants} from "../../src/PrecompileLib.sol";
+import {PrecompileLib} from "../../src/PrecompileLib.sol";
 
 contract HyperCore is CoreExecution {
     using DoubleEndedQueue for DoubleEndedQueue.Bytes32Deque;
+
+    enum BridgeActionStatus {
+        NONE,
+        FILLED,
+        PARTIAL_FILLED,
+        OPEN,
+        CANCELED,
+        REJECTED,
+        UNSUPPORTED,
+        ERROR
+    }
+
+    enum BridgeReasonCode {
+        NONE,
+        UNSUPPORTED_KIND,
+        DECODE_FAILED,
+        SYMBOL_NOT_MAPPED,
+        UNSUPPORTED_TIF,
+        INSUFFICIENT_BALANCE,
+        ORDER_NOT_FOUND,
+        ENGINE_ERROR,
+        INVALID_ACTION
+    }
+
+    struct OrderOutcome {
+        uint8 status;
+        uint8 reason;
+        uint64 l1Block;
+        uint64 filledAmount;
+        uint64 executionPrice;
+    }
+
+    error ActionAlreadyProcessed(uint64 actionId);
+    error InsufficientBalance();
+
+    mapping(uint64 actionId => bool isProcessed) public processedActions;
+    mapping(uint128 cloid => OrderOutcome outcome) public orderOutcomes;
+
+    uint64 public simulatedL1BlockNumber;
+
+    event BridgeActionApplied(
+        uint64 indexed actionId,
+        address indexed sender,
+        uint32 indexed spotIndex,
+        bool isBuy,
+        uint64 filledAmount,
+        uint64 executionPrice,
+        uint128 cloid,
+        uint8 status,
+        uint8 reason,
+        uint64 l1Block
+    );
+
+    event SpotSendApplied(
+        uint64 indexed actionId,
+        address indexed sender,
+        address indexed recipient,
+        uint64 token,
+        uint64 amount,
+        uint64 l1Block
+    );
 
     function executeRawAction(address sender, uint24 kind, bytes calldata data) public payable {
         if (kind == HLConstants.LIMIT_ORDER_ACTION) {
@@ -65,6 +127,177 @@ contract HyperCore is CoreExecution {
             _withdrawQueue.popFront();
 
             _accounts[request.account].spot[HLConstants.hypeTokenIndex()] += request.amount;
+        }
+    }
+
+    function applyBridgeActionResult(
+        uint64 actionId,
+        address sender,
+        uint32 spotIndex,
+        bool isBuy,
+        uint64 baseToken,
+        uint64 quoteToken,
+        uint64 filledAmount,
+        uint64 executionPrice,
+        uint128 cloid,
+        uint8 status,
+        uint8 reason,
+        uint64 l1Block
+    ) external {
+        _ensureAccountWithToken(sender, baseToken);
+        _ensureAccountWithToken(sender, quoteToken);
+
+        _ensureNotProcessed(actionId);
+        _markProcessed(actionId, l1Block);
+
+        if (
+            status == uint8(BridgeActionStatus.FILLED) || status == uint8(BridgeActionStatus.PARTIAL_FILLED)
+                || status == uint8(BridgeActionStatus.OPEN)
+        ) {
+            if (filledAmount > 0) {
+                uint64 quoteAmount = uint64((uint256(filledAmount) * executionPrice) / 1e8);
+
+                if (isBuy) {
+                    if (_accounts[sender].spot[quoteToken] < quoteAmount) {
+                        revert InsufficientBalance();
+                    }
+                    _accounts[sender].spot[quoteToken] -= quoteAmount;
+                    _accounts[sender].spot[baseToken] += filledAmount;
+                } else {
+                    if (_accounts[sender].spot[baseToken] < filledAmount) {
+                        revert InsufficientBalance();
+                    }
+                    _accounts[sender].spot[baseToken] -= filledAmount;
+                    _accounts[sender].spot[quoteToken] += quoteAmount;
+                }
+            }
+
+            if (executionPrice > 0) {
+                _spotPrice[spotIndex] = executionPrice;
+            }
+        }
+
+        if (cloid != 0) {
+            orderOutcomes[cloid] = OrderOutcome({
+                status: status,
+                reason: reason,
+                l1Block: l1Block,
+                filledAmount: filledAmount,
+                executionPrice: executionPrice
+            });
+        }
+
+        emit BridgeActionApplied(
+            actionId, sender, spotIndex, isBuy, filledAmount, executionPrice, cloid, status, reason, l1Block
+        );
+    }
+
+    function applySpotSendAction(
+        uint64 actionId,
+        address sender,
+        address recipient,
+        uint64 token,
+        uint64 amount,
+        uint64 l1Block
+    ) external {
+        _ensureAccountWithToken(sender, token);
+        _ensureAccountWithToken(recipient, token);
+
+        _ensureNotProcessed(actionId);
+
+        if (_accounts[sender].spot[token] < amount) {
+            revert InsufficientBalance();
+        }
+
+        _accounts[sender].spot[token] -= amount;
+        _accounts[recipient].spot[token] += amount;
+
+        _markProcessed(actionId, l1Block);
+
+        emit SpotSendApplied(actionId, sender, recipient, token, amount, l1Block);
+    }
+
+    function markBridgeActionProcessed(uint64 actionId, uint8 status, uint8 reason, uint64 l1Block, uint128 cloid)
+        external
+    {
+        _ensureNotProcessed(actionId);
+        _markProcessed(actionId, l1Block);
+
+        if (cloid != 0) {
+            orderOutcomes[cloid] =
+                OrderOutcome({status: status, reason: reason, l1Block: l1Block, filledAmount: 0, executionPrice: 0});
+        }
+    }
+
+    function getOrderOutcome(uint128 cloid)
+        external
+        view
+        returns (uint8 status, uint8 reason, uint64 l1Block, uint64 filledAmount, uint64 executionPrice)
+    {
+        OrderOutcome memory outcome = orderOutcomes[cloid];
+        return (outcome.status, outcome.reason, outcome.l1Block, outcome.filledAmount, outcome.executionPrice);
+    }
+
+    function setSimulatedL1BlockNumber(uint64 l1Block) external {
+        if (l1Block > simulatedL1BlockNumber) {
+            simulatedL1BlockNumber = l1Block;
+        }
+
+        if (simulatedL1BlockNumber > _l1BlockNumber) {
+            _l1BlockNumber = simulatedL1BlockNumber;
+        }
+    }
+
+    function registerToken(uint64 index, PrecompileLib.TokenInfo calldata info) external {
+        registerTokenInfo(index, info);
+    }
+
+    function registerSpotMarket(uint32 index, PrecompileLib.SpotInfo calldata info) external {
+        registerSpotInfo(index, info);
+    }
+
+    function setSpotBalance(address user, uint64 token, uint64 total, uint64) external {
+        forceSpotBalance(user, token, total);
+    }
+
+    function setSpotPrice(uint32 spotIndex, uint64 price) external {
+        setSpotPx(spotIndex, price);
+    }
+
+    function getSpotInfo(uint32 index) external returns (PrecompileLib.SpotInfo memory) {
+        return readSpotInfo(index);
+    }
+
+    function spotBalances(address user, uint64 token) external returns (uint64) {
+        return readSpotBalance(user, token).total;
+    }
+
+    function accounts(address user) external view returns (bool activated, uint64 perpBalance, uint64 stakingBalance) {
+        return (_accounts[user].activated, _accounts[user].perpBalance, _accounts[user].staking);
+    }
+
+    function _ensureNotProcessed(uint64 actionId) internal view {
+        if (processedActions[actionId]) {
+            revert ActionAlreadyProcessed(actionId);
+        }
+    }
+
+    function _markProcessed(uint64 actionId, uint64 l1Block) internal {
+        processedActions[actionId] = true;
+
+        if (l1Block > simulatedL1BlockNumber) {
+            simulatedL1BlockNumber = l1Block;
+        }
+
+        if (simulatedL1BlockNumber > _l1BlockNumber) {
+            _l1BlockNumber = simulatedL1BlockNumber;
+        }
+    }
+
+    function _ensureAccountWithToken(address account, uint64 token) internal {
+        if (!_initializedSpotBalance[account][token]) {
+            registerTokenInfo(token);
+            _initializeAccountWithToken(account, token);
         }
     }
 }
