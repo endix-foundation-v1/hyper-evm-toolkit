@@ -426,10 +426,14 @@ contract CoreExecution is CoreView {
             }
             address evmContract = _tokens[action.token].evmContract;
             transferAmount = fromWei(action._wei, _tokens[action.token].evmExtraWeiDecimals);
-            
-            if (evmContract != address(HLConstants.coreDepositWallet())) {
-                deal(evmContract, systemAddress, IERC20(evmContract).balanceOf(systemAddress) + transferAmount);
+
+            if (evmContract == address(HLConstants.coreDepositWallet())) {
+                vm.startPrank(evmContract);
+                IERC20(HLConstants.usdc()).safeTransfer(sender, transferAmount);
+                return;
             }
+
+            deal(evmContract, systemAddress, IERC20(evmContract).balanceOf(systemAddress) + transferAmount);
 
             vm.startPrank(systemAddress);
             IERC20(evmContract).safeTransfer(sender, transferAmount);

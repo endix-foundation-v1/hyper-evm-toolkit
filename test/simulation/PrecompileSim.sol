@@ -28,8 +28,6 @@ contract PrecompileSim {
     address constant ACCOUNT_MARGIN_SUMMARY_PRECOMPILE_ADDRESS = 0x000000000000000000000000000000000000080F;
     address constant CORE_USER_EXISTS_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000810;
 
-    receive() external payable {}
-
     fallback(bytes calldata data) external returns (bytes memory) {
         if (address(this) == SPOT_BALANCE_PRECOMPILE_ADDRESS) {
             (address user, uint64 token) = abi.decode(data, (address, uint64));
