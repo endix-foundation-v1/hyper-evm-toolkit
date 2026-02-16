@@ -22,7 +22,7 @@ contract BridgingTest is Test {
         CoreWriterLib.bridgeToCore(address(USDC), 1000e6);
         vm.stopPrank();
 
-        uint64 activationFee = !PrecompileLib.coreUserExists(user) ? 1e8 : 0;
+        uint64 activationFee = 1e8;
 
         CoreSimulatorLib.nextBlock();
 
@@ -39,7 +39,7 @@ contract BridgingTest is Test {
         CoreWriterLib.bridgeUsdcToCoreFor(recipient, 1000e6, HLConstants.SPOT_DEX);
         vm.stopPrank();
 
-        uint64 activationFee = !PrecompileLib.coreUserExists(recipient) ? 1e8 : 0;
+        uint64 activationFee = 1e8;
 
         CoreSimulatorLib.nextBlock();
 
