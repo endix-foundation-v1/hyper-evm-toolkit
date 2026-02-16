@@ -19,18 +19,76 @@ contract CoreWriterSim {
         uint256 value;
     }
 
+    enum Mode {
+        SYNC,
+        QUEUE
+    }
+
+    struct QueuedAction {
+        uint64 actionId;
+        address sender;
+        uint24 kind;
+        bytes payload;
+        uint64 l1Block;
+    }
+
     mapping(uint256 id => Action) _actions;
 
+    uint64 private _nextActionId = 1;
+    uint256 private _queueHead;
+    uint256 private _queueTail;
+    mapping(uint256 index => QueuedAction action) private _queuedActions;
+
     event RawAction(address indexed user, bytes data);
+    event ActionQueued(uint64 indexed actionId, address indexed sender, uint24 indexed kind, uint64 l1Block, bytes payload);
 
     HyperCore constant _hyperCore = HyperCore(payable(0x9999999999999999999999999999999999999999));
 
     /////// testing config
     /////////////////////////
     bool public revertOnFailure;
+    Mode public mode;
 
     function setRevertOnFailure(bool _revertOnFailure) public {
         revertOnFailure = _revertOnFailure;
+    }
+
+    function setMode(Mode newMode) public {
+        mode = newMode;
+    }
+
+    function getQueueLength() public view returns (uint256) {
+        return _queueTail - _queueHead;
+    }
+
+    function getQueuedActions(uint256 offset, uint256 limit) external view returns (QueuedAction[] memory actions) {
+        uint256 queueLength = getQueueLength();
+        if (offset >= queueLength || limit == 0) {
+            return new QueuedAction[](0);
+        }
+
+        uint256 available = queueLength - offset;
+        uint256 size = limit < available ? limit : available;
+        actions = new QueuedAction[](size);
+
+        for (uint256 i = 0; i < size; i++) {
+            actions[i] = _queuedActions[_queueHead + offset + i];
+        }
+    }
+
+    function consumeQueuedActions(uint256 count) external {
+        uint256 queueLength = getQueueLength();
+        require(count <= queueLength, "Consume exceeds queue length");
+
+        for (uint256 i = 0; i < count; i++) {
+            delete _queuedActions[_queueHead + i];
+        }
+
+        _queueHead += count;
+        if (_queueHead == _queueTail) {
+            _queueHead = 0;
+            _queueTail = 0;
+        }
     }
 
     function enqueueAction(bytes memory data, uint256 value) public {
@@ -97,7 +155,31 @@ contract CoreWriterSim {
 
         uint24 kind = (uint24(uint8(data[1])) << 16) | (uint24(uint8(data[2])) << 8) | (uint24(uint8(data[3])));
 
-        bytes memory call = abi.encodeCall(HyperCore.executeRawAction, (msg.sender, kind, data[4:]));
+        bytes memory payload = data[4:];
+
+        if (mode == Mode.QUEUE) {
+            if (_nextActionId == 0) {
+                _nextActionId = 1;
+            }
+
+            uint64 actionId = _nextActionId++;
+            uint64 l1Block = uint64(block.number);
+
+            _queuedActions[_queueTail] = QueuedAction({
+                actionId: actionId,
+                sender: msg.sender,
+                kind: kind,
+                payload: payload,
+                l1Block: l1Block
+            });
+            _queueTail++;
+
+            emit ActionQueued(actionId, msg.sender, kind, l1Block, payload);
+            emit RawAction(msg.sender, data);
+            return;
+        }
+
+        bytes memory call = abi.encodeCall(HyperCore.executeRawAction, (msg.sender, kind, payload));
 
         enqueueAction(block.timestamp, call, 0);
 
