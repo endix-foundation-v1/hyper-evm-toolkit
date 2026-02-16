@@ -8,6 +8,7 @@ import {BaseSimulatorTest} from "../../BaseSimulatorTest.sol";
 import {CoreSimulatorLib} from "../../simulation/CoreSimulatorLib.sol";
 import {CoreWriterSim} from "../../simulation/CoreWriterSim.sol";
 import {HyperCore} from "../../simulation/HyperCore.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 interface ICoreDepositWalletSim {
     error InsufficientAmountForActivation();
@@ -16,6 +17,8 @@ interface ICoreDepositWalletSim {
 }
 
 contract VHCForkExtensionsTest is BaseSimulatorTest {
+    using SafeCast for uint256;
+
     uint32 internal constant SPOT_INDEX = 1;
     uint64 internal constant BASE_TOKEN = 1;
     uint64 internal constant QUOTE_TOKEN = 0;
@@ -61,7 +64,7 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
         assertEq(actions[0].actionId, 1);
         assertEq(actions[0].sender, alice);
         assertEq(actions[0].kind, HLConstants.LIMIT_ORDER_ACTION);
-        assertEq(actions[0].l1Block, uint64(block.number));
+        assertEq(actions[0].l1Block, block.number.toUint64());
 
         (uint32 asset, bool isBuy, uint64 limitPx, uint64 size,, uint8 tif, uint128 cloid) =
             abi.decode(actions[0].payload, (uint32, bool, uint64, uint64, bool, uint8, uint128));
@@ -105,6 +108,67 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
 
         vm.expectRevert(abi.encodeWithSelector(HyperCore.ActionAlreadyProcessed.selector, actionId));
         _applyFilledResult(actionId, cloid, l1Block);
+    }
+
+    function test_applyBridgeActionResult_revertsOnInvalidStatus() public {
+        vm.expectRevert(abi.encodeWithSelector(HyperCore.InvalidBridgeActionStatus.selector, uint8(255)));
+        CoreSimulatorLib.applyBridgeActionResult(
+            uint64(91),
+            alice,
+            SPOT_INDEX,
+            true,
+            BASE_TOKEN,
+            QUOTE_TOKEN,
+            uint64(0),
+            uint64(100e8),
+            uint128(0),
+            uint8(255),
+            uint8(HyperCore.BridgeReasonCode.NONE),
+            uint64(1001)
+        );
+    }
+
+    function test_applyBridgeActionResult_revertsOnInvalidFilledReason() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                HyperCore.InvalidBridgeOutcomeSemantics.selector,
+                uint8(HyperCore.BridgeActionStatus.FILLED),
+                uint8(HyperCore.BridgeReasonCode.ENGINE_ERROR),
+                uint64(2e8)
+            )
+        );
+
+        CoreSimulatorLib.applyBridgeActionResult(
+            uint64(92),
+            alice,
+            SPOT_INDEX,
+            true,
+            BASE_TOKEN,
+            QUOTE_TOKEN,
+            uint64(2e8),
+            uint64(100e8),
+            uint128(0),
+            uint8(HyperCore.BridgeActionStatus.FILLED),
+            uint8(HyperCore.BridgeReasonCode.ENGINE_ERROR),
+            uint64(1002)
+        );
+    }
+
+    function test_markBridgeActionProcessed_revertsOnNonTerminalStatus() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                HyperCore.InvalidBridgeActionStatus.selector,
+                uint8(HyperCore.BridgeActionStatus.OPEN)
+            )
+        );
+
+        CoreSimulatorLib.markBridgeActionProcessed(
+            uint64(93),
+            uint8(HyperCore.BridgeActionStatus.OPEN),
+            uint8(HyperCore.BridgeReasonCode.NONE),
+            uint64(1003),
+            uint128(0)
+        );
     }
 
     function test_markBridgeActionProcessed_storesRejectedOutcome() public {

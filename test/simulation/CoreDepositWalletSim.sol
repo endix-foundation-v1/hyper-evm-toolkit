@@ -6,9 +6,11 @@ import {HLConstants} from "../../src/common/HLConstants.sol";
 import {PrecompileLib} from "../../src/PrecompileLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 contract CoreDepositWalletSim {
     using SafeERC20 for IERC20;
+    using SafeCast for uint256;
 
     HyperCore constant _hyperCore = HyperCore(payable(0x9999999999999999999999999999999999999999));
 
@@ -41,7 +43,7 @@ contract CoreDepositWalletSim {
             revert AmountTooLarge();
         }
 
-        uint64 coreAmount = uint64(converted);
+        uint64 coreAmount = converted.toUint64();
         uint64 creditedAmount = coreAmount;
 
         if (!PrecompileLib.coreUserExists(recipient)) {
@@ -59,7 +61,7 @@ contract CoreDepositWalletSim {
             revert AmountTooLarge();
         }
 
-        _hyperCore.forceSpotBalance(recipient, tokenIndex, uint64(nextTotal));
+        _hyperCore.forceSpotBalance(recipient, tokenIndex, nextTotal.toUint64());
 
         emit DepositSimulated(caller, recipient, creditedAmount, destinationDex);
     }

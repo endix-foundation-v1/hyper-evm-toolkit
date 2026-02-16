@@ -5,9 +5,11 @@ import {CoreExecution} from "./hyper-core/CoreExecution.sol";
 import {DoubleEndedQueue} from "@openzeppelin/contracts/utils/structs/DoubleEndedQueue.sol";
 import {HLConstants} from "../../src/PrecompileLib.sol";
 import {PrecompileLib} from "../../src/PrecompileLib.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 contract HyperCore is CoreExecution {
     using DoubleEndedQueue for DoubleEndedQueue.Bytes32Deque;
+    using SafeCast for uint256;
 
     enum BridgeActionStatus {
         NONE,
@@ -42,6 +44,9 @@ contract HyperCore is CoreExecution {
 
     error ActionAlreadyProcessed(uint64 actionId);
     error InsufficientBalance();
+    error InvalidBridgeActionStatus(uint8 status);
+    error InvalidBridgeReasonCode(uint8 reason);
+    error InvalidBridgeOutcomeSemantics(uint8 status, uint8 reason, uint64 filledAmount);
 
     mapping(uint64 actionId => bool isProcessed) public processedActions;
     mapping(uint128 cloid => OrderOutcome outcome) public orderOutcomes;
@@ -144,18 +149,17 @@ contract HyperCore is CoreExecution {
         uint8 reason,
         uint64 l1Block
     ) external {
+        BridgeActionStatus bridgeStatus = _validateBridgeOutcome(status, reason, filledAmount);
+
         _ensureAccountWithToken(sender, baseToken);
         _ensureAccountWithToken(sender, quoteToken);
 
         _ensureNotProcessed(actionId);
         _markProcessed(actionId, l1Block);
 
-        if (
-            status == uint8(BridgeActionStatus.FILLED) || status == uint8(BridgeActionStatus.PARTIAL_FILLED)
-                || status == uint8(BridgeActionStatus.OPEN)
-        ) {
+        if (_isStatusWithBalanceUpdate(bridgeStatus)) {
             if (filledAmount > 0) {
-                uint64 quoteAmount = uint64((uint256(filledAmount) * executionPrice) / 1e8);
+                uint64 quoteAmount = ((uint256(filledAmount) * executionPrice) / 1e8).toUint64();
 
                 if (isBuy) {
                     if (_accounts[sender].spot[quoteToken] < quoteAmount) {
@@ -220,6 +224,11 @@ contract HyperCore is CoreExecution {
     function markBridgeActionProcessed(uint64 actionId, uint8 status, uint8 reason, uint64 l1Block, uint128 cloid)
         external
     {
+        BridgeActionStatus bridgeStatus = _validateBridgeOutcome(status, reason, 0);
+        if (_isStatusWithBalanceUpdate(bridgeStatus)) {
+            revert InvalidBridgeActionStatus(status);
+        }
+
         _ensureNotProcessed(actionId);
         _markProcessed(actionId, l1Block);
 
@@ -280,6 +289,37 @@ contract HyperCore is CoreExecution {
         if (processedActions[actionId]) {
             revert ActionAlreadyProcessed(actionId);
         }
+    }
+
+    function _validateBridgeOutcome(uint8 status, uint8 reason, uint64 filledAmount)
+        internal
+        pure
+        returns (BridgeActionStatus bridgeStatus)
+    {
+        if (status > uint8(BridgeActionStatus.ERROR) || status == uint8(BridgeActionStatus.NONE)) {
+            revert InvalidBridgeActionStatus(status);
+        }
+
+        if (reason > uint8(BridgeReasonCode.INVALID_ACTION)) {
+            revert InvalidBridgeReasonCode(reason);
+        }
+
+        bridgeStatus = BridgeActionStatus(status);
+        if (_isStatusWithBalanceUpdate(bridgeStatus)) {
+            if (reason != uint8(BridgeReasonCode.NONE)) {
+                revert InvalidBridgeOutcomeSemantics(status, reason, filledAmount);
+            }
+            return bridgeStatus;
+        }
+
+        if (reason == uint8(BridgeReasonCode.NONE) || filledAmount > 0) {
+            revert InvalidBridgeOutcomeSemantics(status, reason, filledAmount);
+        }
+    }
+
+    function _isStatusWithBalanceUpdate(BridgeActionStatus status) internal pure returns (bool) {
+        return status == BridgeActionStatus.FILLED || status == BridgeActionStatus.PARTIAL_FILLED
+            || status == BridgeActionStatus.OPEN;
     }
 
     function _markProcessed(uint64 actionId, uint64 l1Block) internal {

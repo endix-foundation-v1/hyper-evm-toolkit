@@ -3,11 +3,13 @@ pragma solidity ^0.8.28;
 
 import {Heap} from "@openzeppelin/contracts/utils/structs/Heap.sol";
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {HyperCore, CoreExecution} from "./HyperCore.sol";
 
 contract CoreWriterSim {
     using Address for address;
     using Heap for Heap.Uint256Heap;
+    using SafeCast for uint256;
 
     uint128 private _sequence;
 
@@ -163,7 +165,7 @@ contract CoreWriterSim {
             }
 
             uint64 actionId = _nextActionId++;
-            uint64 l1Block = uint64(block.number);
+            uint64 l1Block = block.number.toUint64();
 
             _queuedActions[_queueTail] = QueuedAction({
                 actionId: actionId,
