@@ -6,6 +6,7 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {HyperCore} from "./HyperCore.sol";
 import {CoreWriterSim} from "./CoreWriterSim.sol";
 import {PrecompileSim} from "./PrecompileSim.sol";
+import {CoreDepositWalletSim} from "./CoreDepositWalletSim.sol";
 
 import {PrecompileLib, HLConstants} from "../../src/PrecompileLib.sol";
 import {TokenRegistry} from "../../src/registry/TokenRegistry.sol";
@@ -45,6 +46,7 @@ library CoreSimulatorLib {
         hyperCore.setPerpMakerFee(150);
 
         vm.etch(address(coreWriter), type(CoreWriterSim).runtimeCode);
+        vm.etch(HLConstants.coreDepositWallet(), type(CoreDepositWalletSim).runtimeCode);
 
         // Initialize precompiles
         for (uint160 i = 0; i < NUM_PRECOMPILES; i++) {
@@ -62,6 +64,7 @@ library CoreSimulatorLib {
 
         vm.allowCheatcodes(address(hyperCore));
         vm.allowCheatcodes(address(coreWriter));
+        vm.allowCheatcodes(HLConstants.coreDepositWallet());
 
         // if offline mode, deploy the TokenRegistry and register main tokens
         if (!isForkActive()) {
@@ -122,6 +125,81 @@ library CoreSimulatorLib {
 
     function setRevertOnFailure(bool _revertOnFailure) internal {
         coreWriter.setRevertOnFailure(_revertOnFailure);
+    }
+
+    function setCoreWriterMode(CoreWriterSim.Mode mode) internal {
+        coreWriter.setMode(mode);
+    }
+
+    function setCoreWriterQueueMode() internal {
+        coreWriter.setMode(CoreWriterSim.Mode.QUEUE);
+    }
+
+    function getQueuedActionCount() internal view returns (uint256) {
+        return coreWriter.getQueueLength();
+    }
+
+    function getQueuedActions(uint256 offset, uint256 limit)
+        internal
+        view
+        returns (CoreWriterSim.QueuedAction[] memory)
+    {
+        return coreWriter.getQueuedActions(offset, limit);
+    }
+
+    function consumeQueuedActions(uint256 count) internal {
+        coreWriter.consumeQueuedActions(count);
+    }
+
+    function applyBridgeActionResult(
+        uint64 actionId,
+        address sender,
+        uint32 spotIndex,
+        bool isBuy,
+        uint64 baseToken,
+        uint64 quoteToken,
+        uint64 filledAmount,
+        uint64 executionPrice,
+        uint128 cloid,
+        uint8 status,
+        uint8 reason,
+        uint64 l1Block
+    ) internal {
+        hyperCore.applyBridgeActionResult(
+            actionId,
+            sender,
+            spotIndex,
+            isBuy,
+            baseToken,
+            quoteToken,
+            filledAmount,
+            executionPrice,
+            cloid,
+            status,
+            reason,
+            l1Block
+        );
+    }
+
+    function applySpotSendAction(
+        uint64 actionId,
+        address sender,
+        address recipient,
+        uint64 token,
+        uint64 amount,
+        uint64 l1Block
+    ) internal {
+        hyperCore.applySpotSendAction(actionId, sender, recipient, token, amount, l1Block);
+    }
+
+    function markBridgeActionProcessed(uint64 actionId, uint8 status, uint8 reason, uint64 l1Block, uint128 cloid)
+        internal
+    {
+        hyperCore.markBridgeActionProcessed(actionId, status, reason, l1Block, cloid);
+    }
+
+    function setSimulatedL1BlockNumber(uint64 l1Block) internal {
+        hyperCore.setSimulatedL1BlockNumber(l1Block);
     }
 
     // cheatcodes //
