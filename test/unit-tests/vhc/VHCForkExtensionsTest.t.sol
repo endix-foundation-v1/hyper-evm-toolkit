@@ -95,8 +95,13 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
         assertTrue(hyperCore.processedActions(actionId));
         assertEq(hyperCore.simulatedL1BlockNumber(), l1Block);
 
+        uint64 quoteAmount = uint64(200e8);
+        uint64 feeAmount = (hyperCore.spotMakerFee() > 0)
+            ? SafeCast.toUint64((uint256(quoteAmount) * uint256(hyperCore.spotMakerFee())) / hyperCore.FEE_DENOMINATOR())
+            : 0;
+
         assertEq(PrecompileLib.spotBalance(alice, BASE_TOKEN).total, baseBefore + 2e8);
-        assertEq(PrecompileLib.spotBalance(alice, QUOTE_TOKEN).total, quoteBefore - 200e8);
+        assertEq(PrecompileLib.spotBalance(alice, QUOTE_TOKEN).total, quoteBefore - quoteAmount - feeAmount);
 
         (uint8 status, uint8 reason, uint64 storedL1Block, uint64 filledAmount, uint64 executionPrice) =
             hyperCore.getOrderOutcome(cloid);

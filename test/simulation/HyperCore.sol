@@ -160,20 +160,11 @@ contract HyperCore is CoreExecution {
         if (_isStatusWithBalanceUpdate(bridgeStatus)) {
             if (filledAmount > 0) {
                 uint64 quoteAmount = ((uint256(filledAmount) * executionPrice) / 1e8).toUint64();
+                uint64 feeAmount = (spotMakerFee > 0)
+                    ? SafeCast.toUint64((uint256(quoteAmount) * uint256(spotMakerFee)) / FEE_DENOMINATOR)
+                    : 0;
 
-                if (isBuy) {
-                    if (_accounts[sender].spot[quoteToken] < quoteAmount) {
-                        revert InsufficientBalance();
-                    }
-                    _accounts[sender].spot[quoteToken] -= quoteAmount;
-                    _accounts[sender].spot[baseToken] += filledAmount;
-                } else {
-                    if (_accounts[sender].spot[baseToken] < filledAmount) {
-                        revert InsufficientBalance();
-                    }
-                    _accounts[sender].spot[baseToken] -= filledAmount;
-                    _accounts[sender].spot[quoteToken] += quoteAmount;
-                }
+                _applyBridgeSpotBalanceUpdate(sender, isBuy, baseToken, quoteToken, filledAmount, quoteAmount, feeAmount);
             }
 
             if (executionPrice > 0) {
@@ -194,6 +185,36 @@ contract HyperCore is CoreExecution {
         emit BridgeActionApplied(
             actionId, sender, spotIndex, isBuy, filledAmount, executionPrice, cloid, status, reason, l1Block
         );
+    }
+
+    function _applyBridgeSpotBalanceUpdate(
+        address sender,
+        bool isBuy,
+        uint64 baseToken,
+        uint64 quoteToken,
+        uint64 filledAmount,
+        uint64 quoteAmount,
+        uint64 feeAmount
+    ) internal {
+        if (isBuy) {
+            uint64 totalDebit = quoteAmount + feeAmount;
+            if (_accounts[sender].spot[quoteToken] < totalDebit) {
+                revert InsufficientBalance();
+            }
+            _accounts[sender].spot[quoteToken] -= totalDebit;
+            _accounts[sender].spot[baseToken] += filledAmount;
+            return;
+        }
+
+        if (_accounts[sender].spot[baseToken] < filledAmount) {
+            revert InsufficientBalance();
+        }
+        if (quoteAmount <= feeAmount) {
+            revert InsufficientBalance(); // Fee exceeds proceeds
+        }
+
+        _accounts[sender].spot[baseToken] -= filledAmount;
+        _accounts[sender].spot[quoteToken] += (quoteAmount - feeAmount);
     }
 
     function applySpotSendAction(
