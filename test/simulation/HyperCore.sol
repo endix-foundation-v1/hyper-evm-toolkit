@@ -6,6 +6,7 @@ import {DoubleEndedQueue} from "@openzeppelin/contracts/utils/structs/DoubleEnde
 import {HLConstants} from "../../src/PrecompileLib.sol";
 import {PrecompileLib} from "../../src/PrecompileLib.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {RealL1Read} from "../utils/RealL1Read.sol";
 
 contract HyperCore is CoreExecution {
     using DoubleEndedQueue for DoubleEndedQueue.Bytes32Deque;
@@ -59,6 +60,19 @@ contract HyperCore is CoreExecution {
         uint32 indexed spotIndex,
         bool isBuy,
         uint64 filledAmount,
+        uint64 executionPrice,
+        uint128 cloid,
+        uint8 status,
+        uint8 reason,
+        uint64 l1Block
+    );
+
+    event PerpBridgeActionApplied(
+        uint64 indexed actionId,
+        address indexed sender,
+        uint32 indexed perpAsset,
+        bool isBuy,
+        uint64 filledSz,
         uint64 executionPrice,
         uint128 cloid,
         uint8 status,
@@ -185,6 +199,69 @@ contract HyperCore is CoreExecution {
         emit BridgeActionApplied(
             actionId, sender, spotIndex, isBuy, filledAmount, executionPrice, cloid, status, reason, l1Block
         );
+    }
+
+    /// @notice Applies a perp bridge settlement result, mirroring applyBridgeActionResult for spot.
+    /// @dev Validates outcome, ensures the sender's perp account is initialized, marks the action
+    ///      as processed, applies perp balance updates (fees + position + PnL) via the shared
+    ///      _applyBridgePerpBalanceUpdate, records the order outcome, and emits PerpBridgeActionApplied.
+    function applyPerpBridgeActionResult(
+        uint64 actionId,
+        address sender,
+        uint32 perpAsset,
+        bool isBuy,
+        uint64 filledSz,
+        uint64 executionPrice,
+        uint128 cloid,
+        uint8 status,
+        uint8 reason,
+        uint64 l1Block
+    ) external {
+        BridgeActionStatus bridgeStatus = _validateBridgeOutcome(status, reason, filledSz);
+
+        _ensurePerpAccount(sender, uint16(perpAsset));
+
+        _ensureNotProcessed(actionId);
+        _markProcessed(actionId, l1Block);
+
+        if (_isStatusWithBalanceUpdate(bridgeStatus)) {
+            if (filledSz > 0 && executionPrice > 0) {
+                _applyBridgePerpBalanceUpdate(sender, uint16(perpAsset), isBuy, filledSz, executionPrice);
+            }
+
+            if (executionPrice > 0) {
+                _perpMarkPrice[perpAsset] = executionPrice;
+            }
+        }
+
+        if (cloid != 0) {
+            orderOutcomes[cloid] = OrderOutcome({
+                status: status,
+                reason: reason,
+                l1Block: l1Block,
+                filledAmount: filledSz,
+                executionPrice: executionPrice
+            });
+        }
+
+        emit PerpBridgeActionApplied(
+            actionId, sender, perpAsset, isBuy, filledSz, executionPrice, cloid, status, reason, l1Block
+        );
+    }
+
+    /// @dev Ensures the sender account and perp position are initialized for bridge settlement.
+    function _ensurePerpAccount(address account, uint16 perpIndex) internal {
+        if (!_initializedAccounts[account]) {
+            forceAccountActivation(account);
+        }
+
+        if (_perpAssetInfo[perpIndex].maxLeverage == 0) {
+            registerPerpAssetInfo(perpIndex, RealL1Read.perpAssetInfo(perpIndex));
+        }
+
+        if (!_initializedPerpPosition[account][perpIndex]) {
+            _initializeAccountWithPerp(account, perpIndex);
+        }
     }
 
     function _applyBridgeSpotBalanceUpdate(

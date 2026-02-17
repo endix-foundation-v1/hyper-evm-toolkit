@@ -100,63 +100,53 @@ contract CoreExecution is CoreView {
     }
 
     function _executePerpLong(address sender, LimitOrderAction memory action, uint256 markPx) internal {
-        uint16 perpIndex = uint16(action.asset);
+        _applyBridgePerpBalanceUpdate(sender, uint16(action.asset), true, action.sz, markPx.toUint64());
+    }
+
+    function _executePerpShort(address sender, LimitOrderAction memory action, uint256 markPx) internal {
+        _applyBridgePerpBalanceUpdate(sender, uint16(action.asset), false, action.sz, markPx.toUint64());
+    }
+
+    /// @notice Shared perp settlement logic used by both executeRawAction and bridge paths.
+    /// @dev Deducts fees from perpBalance, updates position (open/increase/reduce/flip/close),
+    ///      realizes PnL on close/reduce, and maintains position tracking sets.
+    /// @param sender The account whose position is being updated.
+    /// @param perpIndex The perpetual asset index.
+    /// @param isBuy True for long (buy), false for short (sell).
+    /// @param sz The filled size in szDecimals.
+    /// @param executionPrice The execution price (markPx for Level 1, or explicit for bridge).
+    function _applyBridgePerpBalanceUpdate(
+        address sender,
+        uint16 perpIndex,
+        bool isBuy,
+        uint64 sz,
+        uint64 executionPrice
+    ) internal {
         int64 szi = _accounts[sender].positions[perpIndex].szi;
         uint32 leverage = _accounts[sender].positions[perpIndex].leverage;
 
-        uint64 _markPx = markPx.toUint64();
-
-        // Add require checks for safety (e.g., leverage > 0, action.sz > 0, etc.)
         require(leverage > 0, "Invalid leverage");
-        require(action.sz > 0, "Invalid size");
-        require(markPx > 0, "Invalid price");
+        require(sz > 0, "Invalid size");
+        require(executionPrice > 0, "Invalid price");
 
+        // Fee deduction
         if (perpMakerFee > 0) {
-            uint256 notional = uint256(action.sz) * uint256(_markPx);
+            uint256 notional = uint256(sz) * uint256(executionPrice);
             uint64 fee = SafeCast.toUint64((notional * uint256(perpMakerFee)) / FEE_DENOMINATOR);
             require(_accounts[sender].perpBalance >= fee, "insufficient perp balance for fee");
             _accounts[sender].perpBalance -= fee;
         }
 
-        int64 newSzi = szi + int64(action.sz);
-
-        if (szi >= 0) {
-            // No PnL realization for same-direction increase
-            // Update position size (more positive for long)
-            _accounts[sender].positions[perpIndex].szi += int64(action.sz);
-
-            // Additive update to entryNtl to preserve weighted average
-            // New entryNtl = old_entryNtl + (action.sz * markPx)
-            _accounts[sender].positions[perpIndex].entryNtl += uint64(action.sz) * uint64(markPx);
+        int64 newSzi;
+        if (isBuy) {
+            newSzi = szi + int64(sz);
+            _applyLongPositionUpdate(sender, perpIndex, szi, newSzi, sz, executionPrice, leverage);
         } else {
-            if (newSzi <= 0) {
-                uint64 avgEntryPrice = _accounts[sender].positions[perpIndex].entryNtl / uint64(-szi);
-                int64 pnl = int64(action.sz) * (int64(avgEntryPrice) - int64(_markPx));
-
-                uint64 closedMargin =
-                    (uint64(action.sz) * _accounts[sender].positions[perpIndex].entryNtl / uint64(-szi)) / leverage;
-
-                _accounts[sender].perpBalance = pnl > 0
-                    ? _accounts[sender].perpBalance + uint64(pnl)
-                    : _accounts[sender].perpBalance - uint64(-pnl);
-
-                _accounts[sender].positions[perpIndex].szi = newSzi;
-                _accounts[sender].positions[perpIndex].entryNtl = uint64(-newSzi) * avgEntryPrice;
-            } else {
-                uint64 avgEntryPrice = _accounts[sender].positions[perpIndex].entryNtl / uint64(-szi);
-                int64 pnl = int64(-szi) * (int64(avgEntryPrice) - int64(_markPx));
-                _accounts[sender].perpBalance = pnl > 0
-                    ? _accounts[sender].perpBalance + uint64(pnl)
-                    : _accounts[sender].perpBalance - uint64(-pnl);
-
-                uint64 newLongSize = uint64(newSzi);
-                uint64 newMargin = newLongSize * _markPx / leverage;
-
-                _accounts[sender].positions[perpIndex].szi = newSzi;
-                _accounts[sender].positions[perpIndex].entryNtl = newLongSize * _markPx;
-            }
+            newSzi = szi - int64(sz);
+            _applyShortPositionUpdate(sender, perpIndex, szi, newSzi, sz, executionPrice, leverage);
         }
 
+        // Update position tracking sets
         bytes32 key = _getKey(sender, perpIndex);
         if (szi == 0 && newSzi != 0) {
             _openPerpPositions.add(key);
@@ -167,41 +157,64 @@ contract CoreExecution is CoreView {
         }
     }
 
-    function _executePerpShort(address sender, LimitOrderAction memory action, uint256 markPx) internal {
-        uint16 perpIndex = uint16(action.asset);
-        int64 szi = _accounts[sender].positions[perpIndex].szi;
-        uint32 leverage = _accounts[sender].positions[perpIndex].leverage;
+    function _applyLongPositionUpdate(
+        address sender,
+        uint16 perpIndex,
+        int64 szi,
+        int64 newSzi,
+        uint64 sz,
+        uint64 execPx,
+        uint32 leverage
+    ) private {
+        if (szi >= 0) {
+            // Same-direction increase — no PnL
+            _accounts[sender].positions[perpIndex].szi += int64(sz);
+            _accounts[sender].positions[perpIndex].entryNtl += uint64(sz) * execPx;
+        } else {
+            if (newSzi <= 0) {
+                // Partial close of short position
+                uint64 avgEntryPrice = _accounts[sender].positions[perpIndex].entryNtl / uint64(-szi);
+                int64 pnl = int64(sz) * (int64(avgEntryPrice) - int64(execPx));
 
-        uint64 _markPx = markPx.toUint64();
+                _accounts[sender].perpBalance = pnl > 0
+                    ? _accounts[sender].perpBalance + uint64(pnl)
+                    : _accounts[sender].perpBalance - uint64(-pnl);
 
-        // Add require checks for safety (e.g., leverage > 0, action.sz > 0, etc.)
-        require(leverage > 0, "Invalid leverage");
-        require(action.sz > 0, "Invalid size");
-        require(markPx > 0, "Invalid price");
+                _accounts[sender].positions[perpIndex].szi = newSzi;
+                _accounts[sender].positions[perpIndex].entryNtl = uint64(-newSzi) * avgEntryPrice;
+            } else {
+                // Full close of short + open long (position flip)
+                uint64 avgEntryPrice = _accounts[sender].positions[perpIndex].entryNtl / uint64(-szi);
+                int64 pnl = int64(-szi) * (int64(avgEntryPrice) - int64(execPx));
+                _accounts[sender].perpBalance = pnl > 0
+                    ? _accounts[sender].perpBalance + uint64(pnl)
+                    : _accounts[sender].perpBalance - uint64(-pnl);
 
-        if (perpMakerFee > 0) {
-            uint256 notional = uint256(action.sz) * uint256(_markPx);
-            uint64 fee = SafeCast.toUint64((notional * uint256(perpMakerFee)) / FEE_DENOMINATOR);
-            require(_accounts[sender].perpBalance >= fee, "insufficient perp balance for fee");
-            _accounts[sender].perpBalance -= fee;
+                uint64 newLongSize = uint64(newSzi);
+                _accounts[sender].positions[perpIndex].szi = newSzi;
+                _accounts[sender].positions[perpIndex].entryNtl = newLongSize * execPx;
+            }
         }
+    }
 
-        int64 newSzi = szi - int64(action.sz);
-
+    function _applyShortPositionUpdate(
+        address sender,
+        uint16 perpIndex,
+        int64 szi,
+        int64 newSzi,
+        uint64 sz,
+        uint64 execPx,
+        uint32 leverage
+    ) private {
         if (szi <= 0) {
-            // No PnL realization for same-direction increase
-            // Update position size (more negative for short)
-            _accounts[sender].positions[perpIndex].szi -= int64(action.sz);
-
-            // Additive update to entryNtl to preserve weighted average
-            // New entryNtl = old_entryNtl + (action.sz * markPx)
-            _accounts[sender].positions[perpIndex].entryNtl += uint64(action.sz) * uint64(markPx);
+            // Same-direction increase — no PnL
+            _accounts[sender].positions[perpIndex].szi -= int64(sz);
+            _accounts[sender].positions[perpIndex].entryNtl += uint64(sz) * execPx;
         } else {
             if (newSzi >= 0) {
+                // Partial close of long position
                 uint64 avgEntryPrice = _accounts[sender].positions[perpIndex].entryNtl / uint64(szi);
-                int64 pnl = int64(action.sz) * (int64(_markPx) - int64(avgEntryPrice));
-                uint64 closedMargin =
-                    (uint64(action.sz) * _accounts[sender].positions[perpIndex].entryNtl / uint64(szi)) / leverage;
+                int64 pnl = int64(sz) * (int64(execPx) - int64(avgEntryPrice));
 
                 _accounts[sender].perpBalance = pnl > 0
                     ? _accounts[sender].perpBalance + uint64(pnl)
@@ -210,27 +223,17 @@ contract CoreExecution is CoreView {
                 _accounts[sender].positions[perpIndex].szi = newSzi;
                 _accounts[sender].positions[perpIndex].entryNtl = uint64(newSzi) * avgEntryPrice;
             } else {
+                // Full close of long + open short (position flip)
                 uint64 avgEntryPrice = _accounts[sender].positions[perpIndex].entryNtl / uint64(szi);
-                int64 pnl = int64(szi) * (int64(_markPx) - int64(avgEntryPrice));
+                int64 pnl = int64(szi) * (int64(execPx) - int64(avgEntryPrice));
                 _accounts[sender].perpBalance = pnl > 0
                     ? _accounts[sender].perpBalance + uint64(pnl)
                     : _accounts[sender].perpBalance - uint64(-pnl);
 
                 uint64 newShortSize = uint64(-newSzi);
-                uint64 newMargin = newShortSize * _markPx / leverage;
-
                 _accounts[sender].positions[perpIndex].szi = newSzi;
-                _accounts[sender].positions[perpIndex].entryNtl = newShortSize * _markPx;
+                _accounts[sender].positions[perpIndex].entryNtl = newShortSize * execPx;
             }
-        }
-
-        bytes32 key = _getKey(sender, perpIndex);
-        if (szi == 0 && newSzi != 0) {
-            _openPerpPositions.add(key);
-            _userPerpPositions[sender].add(perpIndex);
-        } else if (szi != 0 && newSzi == 0) {
-            _openPerpPositions.remove(key);
-            _userPerpPositions[sender].remove(perpIndex);
         }
     }
 
