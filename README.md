@@ -66,18 +66,24 @@ VHC is a local simulation of HyperCore that runs entirely inside Foundry. It rep
 
 **How it works:** `CoreSimulatorLib.init()` etches simulated bytecode at the canonical system addresses (`0x3333...` for CoreWriter, `0x9999...` for HyperCore, `0x0800`–`0x0810` for precompiles). Your contracts call `CoreWriterLib` and `PrecompileLib` as normal — they hit the simulated contracts instead of real precompiles.
 
-All spot order settlement flows through a single path: **`applyBridgeActionResult()`**. This function updates core spot balances, deducts fees, records the order outcome, and emits a `BridgeActionApplied` event — mirroring how the real Hyperliquid bridge settles spot orders from EVM.
+All order settlement flows through dedicated bridge functions:
+- **Spot:** `applyBridgeActionResult()` — updates spot balances, deducts fees, emits `BridgeActionApplied`
+- **Perps:** `applyPerpBridgeActionResult()` — updates perp positions (open/increase/close with PnL), deducts fees, emits `PerpBridgeActionApplied`
+
+Both paths mirror how the real Hyperliquid bridge settles orders from EVM.
 
 ```
 Your Contract
     │
     ├─ CoreWriterLib.placeLimitOrder()   ──►  CoreWriterSim (ring buffer queue)
     ├─ PrecompileLib.spotBalance()       ──►  PrecompileSim (reads from HyperCore state)
+    ├─ PrecompileLib.perpBalance()       ──►  PrecompileSim (reads perp positions)
     │
     └─ nextBlock()                       ──►  CoreSimulatorLib
                                                 ├─ Advance block number + timestamp
-                                                ├─ Check deferred limit orders
-                                                └─ Auto-apply queued spot orders via applyBridgeActionResult()
+                                                ├─ Check deferred spot + perp limit orders
+                                                ├─ Auto-apply queued spot orders via applyBridgeActionResult()
+                                                └─ Auto-apply queued perp orders via applyPerpBridgeActionResult()
 ```
 
 ### Two Runtime Modes
@@ -91,9 +97,9 @@ Your Contract
 
 | Tier | Settlement Method | Learning Curve | Best For |
 |------|-------------------|----------------|----------|
-| **Level 1 — Auto-Apply** | `nextBlock()` auto-fills all queued spot orders at the limit price | Zero | Most protocol tests |
-| **Level 2 — Explicit Settlement** | `consumeAllAndReturn()` + manual `applyFilledSpotOrder()`, `applyRejectedAction()`, etc. | Moderate | Testing rejection, partial fill, error handling |
-| **Level 3 — Realistic Bridge** | TypeScript bridge with real CLOB matching engine ([`bridge/`](./bridge/)) | Advanced | Production-grade simulation with realistic async settlement |
+| **Level 1 — Auto-Apply** | `nextBlock()` auto-fills all queued spot and perp orders at the limit price | Zero | Most protocol tests |
+| **Level 2 — Explicit Settlement** | `consumeAllAndReturn()` + manual `applyFilledSpotOrder()`, `applyFilledPerpOrder()`, etc. | Moderate | Testing rejection, partial fill, error handling |
+| **Level 3 — Realistic Bridge** | TypeScript bridge with real CLOB matching engine for both spot and perps ([`bridge/`](./bridge/)) | Advanced | Production-grade simulation with realistic async settlement |
 
 ---
 
@@ -141,6 +147,41 @@ function test_spotBuy() public {
 
 Orders with limit prices that don't match the current spot price are **deferred** and re-checked on subsequent `nextBlock()` calls.
 
+#### Perp Orders (Level 1)
+
+Perp orders work the same way — place the order, call `nextBlock()`, positions update automatically.
+
+```solidity
+function test_perpLong() public {
+    // Initialize perp account with USDC margin
+    CoreSimulatorLib.forceAccountActivation(alice);
+    CoreSimulatorLib.forceSpotBalance(alice, 0, 1_000_000e8); // USDC for margin
+
+    // Set mark price for the perp asset
+    CoreSimulatorLib.setMarkPx(PERP_ASSET, 20e8); // $20 mark price
+
+    vm.prank(alice);
+    CoreWriterLib.placeLimitOrder(
+        uint32(PERP_ASSET), true, uint64(20e8), uint64(100e8),
+        false, HLConstants.LIMIT_ORDER_TIF_GTC, uint128(42)
+    );
+
+    // Auto-fills perp order via applyPerpBridgeActionResult()
+    CoreSimulatorLib.nextBlock();
+
+    // Position opened: sz > 0, avgEntryPrice set, fee deducted
+    RealL1Read.PerpBalance memory perp = PrecompileLib.perpBalance(alice, PERP_ASSET);
+    assertGt(perp.position.sz, 0);
+}
+```
+
+**Perp mechanics:**
+- Asset IDs: `< 10000` or `>= 100000` (e.g., HYPE perp = 150)
+- Size is scaled from 8-decimal CoreWriter format to the asset's `szDecimals` (HYPE=2, BTC=5, ETH=4)
+- Fees: `notional × perpMakerFee / FEE_DENOMINATOR` (default 0.015%)
+- PnL: Realized on close/reduce — computed from `avgEntryPrice` vs execution price
+- Deferred orders: Re-checked on `nextBlock()` when mark price matches limit
+
 ---
 
 ### Level 2: Explicit Settlement
@@ -172,7 +213,7 @@ function test_partialFill() public {
 }
 ```
 
-**Available Level 2 helpers:**
+**Available Level 2 helpers — Spot:**
 
 | Function | Outcome | Balance Effect |
 |----------|---------|----------------|
@@ -181,13 +222,34 @@ function test_partialFill() public {
 | `applyRejectedAction(action, reason)` | REJECTED | No balance change |
 | `applyErrorAction(action, reason)` | ERROR | No balance change |
 
-Level 1 and Level 2 can be mixed freely in the same test.
+**Available Level 2 helpers — Perps:**
+
+| Function | Outcome | Position Effect |
+|----------|---------|-----------------|
+| `applyFilledPerpOrder(action, executionPrice)` | FILLED | Full position update with fees + PnL |
+| `applyPartialFilledPerpOrder(action, filledSz, executionPrice)` | PARTIAL_FILLED | Partial position update |
+| `applyRejectedPerpAction(action, reason)` | REJECTED | No position change |
+| `applyErrorPerpAction(action, reason)` | ERROR | No position change |
+
+```solidity
+function test_level2_rejectedPerpOrder() public {
+    vm.prank(alice);
+    CoreWriterLib.placeLimitOrder(uint32(PERP_ASSET), /* ... */);
+
+    CoreWriterSim.QueuedAction[] memory actions = CoreSimulatorLib.consumeAllAndReturn();
+    CoreSimulatorLib.applyRejectedPerpAction(
+        actions[0], uint8(HyperCore.BridgeReasonCode.INSUFFICIENT_BALANCE)
+    );
+}
+```
+
+Level 1 and Level 2 can be mixed freely in the same test, for both spot and perp orders.
 
 ---
 
 ### Level 3: Realistic Bridge
 
-The [`bridge/`](./bridge/) directory contains a full TypeScript CLOB matching engine that provides realistic async settlement. It runs as a sidecar process alongside Anvil, polling the CoreWriterSim's ring buffer for queued actions, running them through a real order book, and calling `applyBridgeActionResult()` with the matching result.
+The [`bridge/`](./bridge/) directory contains a full TypeScript CLOB matching engine that provides realistic async settlement for both **spot and perp** orders. It runs as a sidecar process alongside Anvil, polling the CoreWriterSim's ring buffer for queued actions, running them through a real order book, and settling via `applyBridgeActionResult()` (spot) or `applyPerpBridgeActionResult()` (perps).
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
@@ -195,16 +257,33 @@ The [`bridge/`](./bridge/) directory contains a full TypeScript CLOB matching en
 │  (Foundry test)  │     │  (ring buffer)   │     │  (CLOB engine)  │
 │                  │◄────│                  │◄────│                 │
 │  balances update │     │  applyBridge...  │     │  match result   │
+│  positions update│     │  applyPerpBridge │     │  (spot + perps) │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
 ```
 
 Features:
-- Price-time priority CLOB matching engine
+- Price-time priority CLOB matching engine (asset-agnostic — handles both spot and perp symbols)
 - Limit, market, IOC, FOK, GTC order support
 - Iceberg orders with reserve quantities
 - Self-trade prevention
+- Automatic asset classification: spot (`10000 ≤ asset < 100000`) vs perp (`asset < 10000` or `asset ≥ 100000`)
+- Perp orders routed to `applyPerpBridgeActionResult()` — no spot balance check (margin tracked on L1)
 - Deterministic replay via command log
 - WebSocket real-time order book / trade streams
+
+**Bridge configuration** (spot + perps):
+
+```typescript
+coreWriterActionBridge: {
+  enabled: true,
+  mode: 'interval',
+  intervalMs: 100,
+  coreWriterAddress: '0x3333333333333333333333333333333333333333',
+  hyperCoreAddress: '0x9999999999999999999999999999999999999999',
+  marketMap: { '1': 'ETH-USD' },          // spotIndex → engine symbol
+  perpMarketMap: { '150': 'HYPE-PERP' },  // perpAsset → engine symbol
+}
+```
 
 See [`bridge/README.md`](./bridge/README.md) for full documentation.
 
@@ -216,7 +295,9 @@ cd bridge && npm install && npm run dev
 
 ### Fee Settlement
 
-Fees are computed inside `applyBridgeActionResult()`:
+Fees are computed inside the bridge settlement functions:
+
+**Spot fees** (inside `applyBridgeActionResult()`):
 
 ```
 quoteAmount = (filledAmount × executionPrice) / 1e8
@@ -233,6 +314,23 @@ CoreSimulatorLib.setSpotMakerFee(1000); // 0.1%
 CoreSimulatorLib.setSpotMakerFee(0);    // Disable fees
 ```
 
+**Perp fees** (inside `applyPerpBridgeActionResult()`):
+
+```
+notional  = filledSz × executionPrice / 1e8
+feeAmount = notional × perpMakerFee / FEE_DENOMINATOR
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `perpMakerFee` | `150` | 0.015% (1.5 bps) |
+| `FEE_DENOMINATOR` | `1e6` | Fee denominator |
+
+```solidity
+CoreSimulatorLib.setPerpMakerFee(300);  // 0.03%
+CoreSimulatorLib.setPerpMakerFee(0);    // Disable perp fees
+```
+
 ---
 
 ### API Reference
@@ -241,20 +339,31 @@ CoreSimulatorLib.setSpotMakerFee(0);    // Disable fees
 
 | Function | Description |
 |----------|-------------|
-| `nextBlock()` | Advance one block. Auto-fills executable spot orders. |
+| `nextBlock()` | Advance one block. Auto-fills executable spot and perp orders. |
 | `nextBlock(bool expectRevert)` | Same, but doesn't revert on action failures when `true`. |
 
-#### Queue & Settlement (Level 2)
+#### Queue & Settlement — Spot (Level 2)
 
 | Function | Description |
 |----------|-------------|
 | `getQueuedActionCount()` | Number of pending actions. |
-| `getDeferredOrderCount()` | Number of deferred limit orders. |
+| `getDeferredOrderCount()` | Number of deferred spot limit orders. |
 | `consumeAllAndReturn()` | Drain queue and return all actions. |
 | `applyFilledSpotOrder(action, executionPrice)` | Apply FILLED outcome. |
 | `applyPartialFilledSpotOrder(action, filledAmount, executionPrice)` | Apply PARTIAL_FILLED outcome. |
 | `applyRejectedAction(action, reason)` | Apply REJECTED outcome. |
 | `applyErrorAction(action, reason)` | Apply ERROR outcome. |
+
+#### Queue & Settlement — Perps (Level 2)
+
+| Function | Description |
+|----------|-------------|
+| `getDeferredPerpOrderCount()` | Number of deferred perp limit orders. |
+| `applyFilledPerpOrder(action, executionPrice)` | Apply FILLED perp outcome. |
+| `applyPartialFilledPerpOrder(action, filledSz, executionPrice)` | Apply PARTIAL_FILLED perp outcome. |
+| `applyRejectedPerpAction(action, reason)` | Apply REJECTED perp outcome. |
+| `applyErrorPerpAction(action, reason)` | Apply ERROR perp outcome. |
+| `applyPerpBridgeActionResult(...)` | Raw passthrough to HyperCore perp bridge. |
 
 #### State Manipulation
 
@@ -262,10 +371,14 @@ CoreSimulatorLib.setSpotMakerFee(0);    // Disable fees
 |----------|-------------|
 | `forceAccountActivation(addr)` | Activate a Core account. |
 | `forceSpotBalance(addr, token, wei)` | Set spot balance. |
+| `forcePerpBalance(addr, perpAsset, margin)` | Set perp margin balance. |
+| `forcePerpPositionLeverage(addr, perpAsset, leverage)` | Set perp position leverage. |
 | `setSpotPx(spotMarketId, price)` | Set spot market price. |
+| `setMarkPx(perpAsset, price)` | Set perp mark price. |
 | `setSimulatedL1BlockNumber(l1Block)` | Control L1 block number. |
 | `setRevertOnFailure(bool)` | Toggle revert on failure. |
 | `setSpotMakerFee(bps)` | Set spot fee rate. |
+| `setPerpMakerFee(bps)` | Set perp fee rate. |
 
 ---
 
@@ -274,9 +387,11 @@ CoreSimulatorLib.setSpotMakerFee(0);    // Disable fees
 See the [examples](./src/examples/) directory for production library usage.
 
 For testing framework examples:
-* [`VHCForkExtensionsTest.t.sol`](./test/unit-tests/vhc/VHCForkExtensionsTest.t.sol) — Level 1 auto-apply
-* [`VHCLevel2Test.t.sol`](./test/unit-tests/vhc/VHCLevel2Test.t.sol) — Level 2 explicit settlement
+* [`VHCForkExtensionsTest.t.sol`](./test/unit-tests/vhc/VHCForkExtensionsTest.t.sol) — Level 1 auto-apply (spot)
+* [`VHCLevel2Test.t.sol`](./test/unit-tests/vhc/VHCLevel2Test.t.sol) — Level 2 explicit settlement (spot)
 * [`VHCFeeSettlementTest.t.sol`](./test/unit-tests/vhc/VHCFeeSettlementTest.t.sol) — Fee settlement and deferred orders
+* [`VHCPerpLevel1Test.t.sol`](./test/unit-tests/vhc/VHCPerpLevel1Test.t.sol) — Level 1 auto-apply (perps): open/close/increase positions, PnL, fees, deferred orders
+* [`VHCPerpLevel2Test.t.sol`](./test/unit-tests/vhc/VHCPerpLevel2Test.t.sol) — Level 2 explicit settlement (perps): filled, partial, rejected, error outcomes
 * [`CoreSimulatorTest.t.sol`](./test/CoreSimulatorTest.t.sol) — General simulation tests
 
 ---
@@ -294,9 +409,9 @@ For testing framework examples:
 
 This toolkit is a fork and extension of [`hyper-evm-lib`](https://github.com/hyperliquid-dev/hyper-evm-lib) by [Obsidian Audits](https://github.com/ObsidianAudits) ([0xjuaan](https://github.com/0xjuaan), [0xSpearmint](https://github.com/0xspearmint)), with additions by [Endix](https://github.com/endix-foundation-v1):
 
-- **Virtual HyperCore (VHC)** — Three-tier local testing framework
-- **Level 3 Bridge** — TypeScript CLOB matching engine for realistic async settlement
-- **Perps extension points** — Scaffolding for perpetual contract simulation
+- **Virtual HyperCore (VHC)** — Three-tier local testing framework for spot and perps
+- **Level 3 Bridge** — TypeScript CLOB matching engine for realistic async settlement (spot + perps)
+- **Perp Bridge Settlement** — Full perpetual contract simulation with position tracking, PnL, fees, and deferred orders
 
 For support, bug reports, or integration questions, open an [issue](https://github.com/endix-foundation-v1/hyper-evm-toolkit/issues).
 
