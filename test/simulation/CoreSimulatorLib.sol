@@ -34,8 +34,7 @@ library CoreSimulatorLib {
         uint64 baseToken;
         uint64 quoteToken;
         uint64 filledAmount;
-        uint64 adjustedExecPrice;
-        uint64 originalPx;
+        uint64 executionPrice;
     }
 
     struct SpotTokenInfo {
@@ -53,7 +52,7 @@ library CoreSimulatorLib {
         uint64 baseToken;
         uint64 quoteToken;
         uint64 filledAmount;
-        uint64 adjustedExecPrice;
+        uint64 executionPrice;
         uint128 cloid;
         uint64 l1Block;
     }
@@ -166,7 +165,7 @@ library CoreSimulatorLib {
 
     /**
      * @notice Drains queued ring-buffer actions and auto-applies them via ADR-018 routing.
-     * @dev Spot limit orders route through `applyBridgeActionResult(FILLED)` with fee-adjusted
+     * @dev Spot limit orders route through `applyBridgeActionResult(FILLED)` with market
      *      execution price. Spot sends route through `applySpotSendAction()`. Everything else
      *      (perps, vaults, staking, delegation, non-executable spot orders) falls back to
      *      `executeRawAction()`.
@@ -243,15 +242,14 @@ library CoreSimulatorLib {
             baseToken: executionData.baseToken,
             quoteToken: executionData.quoteToken,
             filledAmount: executionData.filledAmount,
-            adjustedExecPrice: executionData.adjustedExecPrice,
+            executionPrice: executionData.executionPrice,
             cloid: cloid,
             l1Block: action.l1Block
         });
 
         success = _applyBridgeActionResultLowLevel(request);
-        if (success) {
-            hyperCore.setSpotPx(spotMarketId, executionData.originalPx);
-        }
+        // ADR-018 Rev 3: No spotPx correction needed — executionPrice is real market price.
+        // FIXME(phase2): handle weiDecimals≠8 spotPrice correction if needed.
 
         return (true, success);
     }
@@ -286,8 +284,7 @@ library CoreSimulatorLib {
             return (false, executionData);
         }
 
-        (bool hasSpotPx, uint64 originalPx, uint64 spotPx) =
-            _tryGetSpotPxForBridge(spotMarketId, spotTokenInfo.baseSzDecimals);
+        (bool hasSpotPx, uint64 spotPx) = _tryGetSpotPxForBridge(spotMarketId, spotTokenInfo.baseSzDecimals);
         if (!hasSpotPx) {
             return (false, executionData);
         }
@@ -297,7 +294,7 @@ library CoreSimulatorLib {
             return (false, executionData);
         }
 
-        (bool hasAmounts, uint64 filledAmount, uint64 adjustedExecPrice) =
+        (bool hasAmounts, uint64 filledAmount, uint64 executionPrice) =
             _tryPrepareBridgeAmounts(isBuy, sz, spotPx, spotTokenInfo.baseWeiDecimals);
         if (!hasAmounts) {
             return (false, executionData);
@@ -306,42 +303,42 @@ library CoreSimulatorLib {
         executionData.baseToken = spotTokenInfo.baseToken;
         executionData.quoteToken = spotTokenInfo.quoteToken;
         executionData.filledAmount = filledAmount;
-        executionData.adjustedExecPrice = adjustedExecPrice;
-        executionData.originalPx = originalPx;
+        executionData.executionPrice = executionPrice;
         return (true, executionData);
     }
 
     function _tryGetSpotPxForBridge(uint32 spotMarketId, uint8 baseSzDecimals)
         private
-        returns (bool hasSpotPx, uint64 originalPx, uint64 spotPx)
+        returns (bool hasSpotPx, uint64 spotPx)
     {
-        originalPx = hyperCore.readSpotPx(spotMarketId);
+        uint64 originalPx = hyperCore.readSpotPx(spotMarketId);
         spotPx = originalPx * SafeCast.toUint64(10 ** baseSzDecimals);
 
         if (spotPx == 0 && !hyperCore.useRealL1Read()) {
             // Preserve executeSpotLimitOrder's offline-mode revert path via executeRawAction fallback.
-            return (false, 0, 0);
+            return (false, 0);
         }
 
-        return (true, originalPx, spotPx);
+        return (true, spotPx);
     }
 
-    function _tryPrepareBridgeAmounts(bool isBuy, uint64 sz, uint64 spotPx, uint8 baseWeiDecimals)
+    function _tryPrepareBridgeAmounts(bool /* isBuy */, uint64 sz, uint64 spotPx, uint8 baseWeiDecimals)
         private
-        returns (bool hasAmounts, uint64 filledAmount, uint64 adjustedExecPrice)
+        returns (bool hasAmounts, uint64 filledAmount, uint64 executionPrice)
     {
         filledAmount = _scale(sz, 8, baseWeiDecimals);
         if (filledAmount == 0) {
             return (false, 0, 0);
         }
 
-        (bool hasAdjustedExecPrice, uint64 computedAdjustedExecPrice) =
-            _computeAdjustedExecPrice(isBuy, sz, spotPx, filledAmount, hyperCore.spotMakerFee());
-        if (!hasAdjustedExecPrice) {
+        // ADR-018 Rev 3: Pass real market price. Fee computed inside applyBridgeActionResult.
+        // Scale price to match filledAmount's decimal representation.
+        executionPrice = SafeCast.toUint64((uint256(sz) * uint256(spotPx)) / uint256(filledAmount));
+        if (executionPrice == 0) {
             return (false, 0, 0);
         }
 
-        return (true, filledAmount, computedAdjustedExecPrice);
+        return (true, filledAmount, executionPrice);
     }
 
     function _applyBridgeActionResultLowLevel(BridgeApplyRequest memory request) private returns (bool success) {
@@ -356,7 +353,7 @@ library CoreSimulatorLib {
                     request.baseToken,
                     request.quoteToken,
                     request.filledAmount,
-                    request.adjustedExecPrice,
+                    request.executionPrice,
                     request.cloid,
                     uint8(1),
                     uint8(0),
@@ -416,39 +413,6 @@ library CoreSimulatorLib {
         spotTokenInfo.baseSzDecimals = baseTokenInfo.szDecimals;
         spotTokenInfo.baseWeiDecimals = baseTokenInfo.weiDecimals;
         return (true, spotTokenInfo);
-    }
-
-    function _computeAdjustedExecPrice(bool isBuy, uint64 sz, uint64 spotPx, uint64 filledAmount, uint16 spotMakerFee)
-        private
-        pure
-        returns (bool canApplyBridge, uint64 adjustedExecPrice)
-    {
-        if (isBuy) {
-            uint64 amountIn = SafeCast.toUint64((uint256(sz) * uint256(spotPx)) / 1e8);
-            uint64 totalDebit = amountIn;
-
-            if (spotMakerFee > 0) {
-                totalDebit = SafeCast.toUint64(uint256(amountIn) + ((uint256(amountIn) * uint256(spotMakerFee)) / 1e6));
-            }
-
-            // Assumes filledAmount == sz for current test tokens (weiDecimals == 8).
-            adjustedExecPrice = SafeCast.toUint64((uint256(totalDebit) * 1e8) / uint256(filledAmount));
-            return (true, adjustedExecPrice);
-        }
-
-        uint64 amountOut = SafeCast.toUint64((uint256(sz) * uint256(spotPx)) / 1e8);
-        uint64 netProceeds = amountOut;
-
-        if (spotMakerFee > 0) {
-            uint64 fee = SafeCast.toUint64((uint256(amountOut) * uint256(spotMakerFee)) / 1e6);
-            if (netProceeds <= fee) {
-                return (false, 0);
-            }
-            netProceeds -= fee;
-        }
-
-        adjustedExecPrice = SafeCast.toUint64((uint256(netProceeds) * 1e8) / uint256(filledAmount));
-        return (true, adjustedExecPrice);
     }
 
     /**
