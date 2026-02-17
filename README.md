@@ -1,21 +1,37 @@
-# hyper-evm-lib
-![License](https://img.shields.io/github/license/hyperliquid-dev/hyper-evm-lib)
+# hyper-evm-toolkit
+
+![License](https://img.shields.io/github/license/endix-foundation-v1/hyper-evm-toolkit)
 ![Solidity](https://img.shields.io/badge/solidity-%3E%3D0.8.0-blue)
+![TypeScript](https://img.shields.io/badge/typescript-%3E%3D5.0-blue)
 
-<img width="900" height="450" alt="Untitled design (2)" src="https://github.com/user-attachments/assets/6c74dc59-baff-4f6a-9dab-3b92d0cfa133" />
+## The all-in-one toolkit for building and testing on HyperEVM
 
-## The all-in-one toolkit to seamlessly build smart contracts on HyperEVM
+A unified framework that combines **Solidity libraries** for HyperEVM development with a **three-tier testing system** for HyperCore interactions. Install via `forge install` (Solidity only) or `npm install` (full toolkit with Level 3 bridge).
 
-This library makes it easy to build on HyperEVM. It provides a unified interface for:
+### What's in the box
 
-* Bridging assets between HyperEVM and Core, abstracting away the complexity of decimal conversions
-* Performing all `CoreWriter` actions
-* Accessing data from native precompiles without needing a token index
-* Retrieving token indexes, and spot market indexes based on their linked evm contract address
+| Layer | Language | Purpose |
+|-------|----------|---------|
+| `src/` | Solidity | CoreWriterLib, PrecompileLib, TokenRegistry — production libraries |
+| `test/simulation/` | Solidity | Level 1 & 2 — local HyperCore simulation for Foundry tests |
+| `bridge/` | TypeScript | Level 3 — realistic CLOB matching engine with async settlement |
 
-The library securely abstracts away the low-level mechanics of Hyperliquid's EVM ↔ Core interactions so you can focus on building your protocol's core business logic.
+---
 
-The testing framework provides a robust simulation engine for HyperCore interactions, enabling local foundry testing of precompile calls, CoreWriter actions, and EVM⇄Core token bridging. This allows developers to test their contracts in a local environment, within seconds, without needing to spend hours deploying and testing on testnet.
+## Installation
+
+### Foundry (Solidity Level 1 & 2)
+
+```sh
+forge install endix-foundation-v1/hyper-evm-toolkit
+echo "@hyper-evm-toolkit/=lib/hyper-evm-toolkit/" >> remappings.txt
+```
+
+### npm (Full toolkit with Level 3 bridge)
+
+```sh
+npm install hyper-evm-toolkit
+```
 
 ---
 
@@ -23,30 +39,22 @@ The testing framework provides a robust simulation engine for HyperCore interact
 
 ### CoreWriterLib
 
-Includes functions to call `CoreWriter` actions, and also has helpers to:
+Functions to call `CoreWriter` actions, with helpers to:
 
 * Bridge tokens to/from Core
 * Convert spot token amount representation between EVM and Core (wei) decimals
 
 ### PrecompileLib
 
-Includes functionality to query the native read precompiles. 
-
-PrecompileLib includes additional functions to query data using EVM token addresses, removing the need to store or pass in the token/spot index. 
+Query native read precompiles, including functions that accept EVM token addresses directly (no manual token index management).
 
 ### TokenRegistry
 
-Precompiles like `spotBalance`, `spotPx` and more, all require either a token index (for `spotBalance`) or a spot market index (for `spotPx`) as an input parameter.
+On-chain mapping from EVM contract addresses to HyperCore token indices, populated trustlessly via precompile lookups. See [`TokenRegistry.sol`](./src/registry/TokenRegistry.sol).
 
-Natively, there is no way to derive the token index given a token's contract address, requiring projects to store it manually, or pass it in as a parameter whenever needed.
+### Virtual HyperCore (VHC) Testing Framework
 
-[TokenRegistry](https://github.com/hyperliquid-dev/hyper-evm-lib/blob/main/src/registry/TokenRegistry.sol) solves this by providing a deployed-onchain mapping from EVM contract addresses to their HyperCore token indices, populated trustlessly using precompile lookups for each index.
-
-### Testing Framework
-
-A robust and flexible test engine for HyperCore interactions, enabling local Foundry testing of precompile calls, CoreWriter actions, and EVM⇄Core token bridging. Tests run in seconds locally — no testnet deployments needed.
-
-For general usage and how it works, see the [docs](https://hyperlib.dev/testing/overview).
+A three-tier simulation engine for HyperCore interactions. Tests run in seconds locally — no testnet deployments needed.
 
 ---
 
@@ -54,9 +62,9 @@ For general usage and how it works, see the [docs](https://hyperlib.dev/testing/
 
 ### Overview
 
-Virtual HyperCore (VHC) is a local simulation of HyperCore that runs entirely inside Foundry. It replaces the real HyperCore precompiles, `CoreWriter`, and `CoreDepositWallet` with simulated contracts, enabling you to write fast, deterministic tests for any protocol that interacts with Hyperliquid's L1.
+VHC is a local simulation of HyperCore that runs entirely inside Foundry. It replaces the real HyperCore precompiles, `CoreWriter`, and `CoreDepositWallet` with simulated contracts, enabling fast, deterministic tests for any protocol that interacts with Hyperliquid's L1.
 
-**How it works:** `CoreSimulatorLib.init()` etches simulated bytecode at the canonical system addresses (`0x3333...` for CoreWriter, `0x9999...` for HyperCore, `0x0800`–`0x0810` for precompiles). Your contracts call `CoreWriterLib` and `PrecompileLib` as normal — they hit the simulated contracts instead of real precompiles, and everything runs locally.
+**How it works:** `CoreSimulatorLib.init()` etches simulated bytecode at the canonical system addresses (`0x3333...` for CoreWriter, `0x9999...` for HyperCore, `0x0800`–`0x0810` for precompiles). Your contracts call `CoreWriterLib` and `PrecompileLib` as normal — they hit the simulated contracts instead of real precompiles.
 
 All spot order settlement flows through a single path: **`applyBridgeActionResult()`**. This function updates core spot balances, deducts fees, records the order outcome, and emits a `BridgeActionApplied` event — mirroring how the real Hyperliquid bridge settles spot orders from EVM.
 
@@ -85,7 +93,7 @@ Your Contract
 |------|-------------------|----------------|----------|
 | **Level 1 — Auto-Apply** | `nextBlock()` auto-fills all queued spot orders at the limit price | Zero | Most protocol tests |
 | **Level 2 — Explicit Settlement** | `consumeAllAndReturn()` + manual `applyFilledSpotOrder()`, `applyRejectedAction()`, etc. | Moderate | Testing rejection, partial fill, error handling |
-| **Level 3 — Realistic Bridge** | TypeScript bridge with real CLOB matching engine | Advanced | Production-grade simulation (separate [`virtual-hypercore`](https://github.com/endix-foundation-v1/virtual-hypercore) package) |
+| **Level 3 — Realistic Bridge** | TypeScript bridge with real CLOB matching engine ([`bridge/`](./bridge/)) | Advanced | Production-grade simulation with realistic async settlement |
 
 ---
 
@@ -94,8 +102,8 @@ Your Contract
 All VHC tests inherit from `BaseSimulatorTest`:
 
 ```solidity
-import {BaseSimulatorTest} from "@hyper-evm-lib/test/BaseSimulatorTest.sol";
-import {CoreSimulatorLib} from "@hyper-evm-lib/test/simulation/CoreSimulatorLib.sol";
+import {BaseSimulatorTest} from "@hyper-evm-toolkit/test/BaseSimulatorTest.sol";
+import {CoreSimulatorLib} from "@hyper-evm-toolkit/test/simulation/CoreSimulatorLib.sol";
 
 contract MyProtocolTest is BaseSimulatorTest {
     address alice = makeAddr("alice");
@@ -140,7 +148,7 @@ Orders with limit prices that don't match the current spot price are **deferred*
 Consume queued actions and apply outcomes manually for full control.
 
 ```solidity
-import {CoreWriterSim} from "@hyper-evm-lib/test/simulation/CoreWriterSim.sol";
+import {CoreWriterSim} from "@hyper-evm-toolkit/test/simulation/CoreWriterSim.sol";
 
 function test_rejectedOrder() public {
     vm.prank(alice);
@@ -174,6 +182,35 @@ function test_partialFill() public {
 | `applyErrorAction(action, reason)` | ERROR | No balance change |
 
 Level 1 and Level 2 can be mixed freely in the same test.
+
+---
+
+### Level 3: Realistic Bridge
+
+The [`bridge/`](./bridge/) directory contains a full TypeScript CLOB matching engine that provides realistic async settlement. It runs as a sidecar process alongside Anvil, polling the CoreWriterSim's ring buffer for queued actions, running them through a real order book, and calling `applyBridgeActionResult()` with the matching result.
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  Your Contract   │────►│  CoreWriterSim   │────►│  TS Bridge      │
+│  (Foundry test)  │     │  (ring buffer)   │     │  (CLOB engine)  │
+│                  │◄────│                  │◄────│                 │
+│  balances update │     │  applyBridge...  │     │  match result   │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+Features:
+- Price-time priority CLOB matching engine
+- Limit, market, IOC, FOK, GTC order support
+- Iceberg orders with reserve quantities
+- Self-trade prevention
+- Deterministic replay via command log
+- WebSocket real-time order book / trade streams
+
+See [`bridge/README.md`](./bridge/README.md) for full documentation.
+
+```bash
+cd bridge && npm install && npm run dev
+```
 
 ---
 
@@ -232,26 +269,15 @@ CoreSimulatorLib.setSpotMakerFee(0);    // Disable fees
 
 ---
 
-## Installation
-
-Install with **Foundry**:
-
-```sh
-forge install hyperliquid-dev/hyper-evm-lib
-echo "@hyper-evm-lib=lib/hyper-evm-lib" >> remappings.txt
-```
----
-
 ## Usage Examples
 
-See the [examples](./src/examples/) directory for examples of how the libraries can be used in practice.
+See the [examples](./src/examples/) directory for production library usage.
 
-To see how the testing framework can be used, refer to [`CoreSimulatorTest.t.sol`](./test/CoreSimulatorTest.t.sol) and the testing framework docs at [https://hyperlib.dev](https://hyperlib.dev/).
-
-For VHC-specific examples:
-* [`VHCForkExtensionsTest.t.sol`](./test/unit-tests/vhc/VHCForkExtensionsTest.t.sol) — Level 1 and bridge-apply examples
+For testing framework examples:
+* [`VHCForkExtensionsTest.t.sol`](./test/unit-tests/vhc/VHCForkExtensionsTest.t.sol) — Level 1 auto-apply
 * [`VHCLevel2Test.t.sol`](./test/unit-tests/vhc/VHCLevel2Test.t.sol) — Level 2 explicit settlement
 * [`VHCFeeSettlementTest.t.sol`](./test/unit-tests/vhc/VHCFeeSettlementTest.t.sol) — Fee settlement and deferred orders
+* [`CoreSimulatorTest.t.sol`](./test/CoreSimulatorTest.t.sol) — General simulation tests
 
 ---
 
@@ -259,22 +285,19 @@ For VHC-specific examples:
 
 * `bridgeToEvm()` for non-HYPE tokens requires the contract to hold HYPE on HyperCore for gas; otherwise, the `spotSend` will fail.
 * Be aware of potential precision loss in `evmToWei()` when the EVM token decimals exceed Core decimals, due to integer division during downscaling.
-* Ensure that contracts are deployed with complete functionality to prevent stuck assets in Core
-  * For example, implementing `bridgeToCore` but not `bridgeToEvm` can lead to stuck, unretrievable assets on HyperCore
-* Note that precompiles return data from the start of the block, so CoreWriter actions will not be reflected in precompile data until next call.
+* Ensure that contracts are deployed with complete functionality to prevent stuck assets in Core (e.g., implementing `bridgeToCore` but not `bridgeToEvm` can lead to stuck assets on HyperCore).
+* Precompiles return data from the start of the block — CoreWriter actions won't be reflected until the next call.
 
 ---
 
-## Contributing
-This toolkit is developed and maintained by the team at [Obsidian Audits](https://github.com/ObsidianAudits):
+## Origin & Credits
 
-- [0xjuaan](https://github.com/0xjuaan)
-- [0xSpearmint](https://github.com/0xspearmint)
+This toolkit is a fork and extension of [`hyper-evm-lib`](https://github.com/hyperliquid-dev/hyper-evm-lib) by [Obsidian Audits](https://github.com/ObsidianAudits) ([0xjuaan](https://github.com/0xjuaan), [0xSpearmint](https://github.com/0xspearmint)), with additions by [Endix](https://github.com/endix-foundation-v1):
 
-For support, bug reports, or integration questions, open an [issue](https://github.com/hyperliquid-dev/hyper-evm-lib/issues) or reach out on [TG](https://t.me/juan_sec)
+- **Virtual HyperCore (VHC)** — Three-tier local testing framework
+- **Level 3 Bridge** — TypeScript CLOB matching engine for realistic async settlement
+- **Perps extension points** — Scaffolding for perpetual contract simulation
 
-The library and testing framework are under active development, and contributions are welcome.
+For support, bug reports, or integration questions, open an [issue](https://github.com/endix-foundation-v1/hyper-evm-toolkit/issues).
 
-Want to improve or extend functionality? Feel free to create a PR.
-
-Help us make building on Hyperliquid as smooth and secure as possible.
+Contributions welcome. Help us make building on Hyperliquid as smooth and secure as possible.

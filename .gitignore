@@ -1,23 +1,31 @@
-# Compiler files
+# Foundry
 cache/
 out/
-
-# Ignores development broadcast logs
 !/broadcast
 /broadcast/*/31337/
 /broadcast/**/dry-run/
-
-# Docs
-docs/
-
-# Dotenv file
-.env
-
-# misc
-lcov.info
-ignored/
-
-# misc
-lcov.info
-ignored/
 broadcast/
+lcov.info
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+ignored/

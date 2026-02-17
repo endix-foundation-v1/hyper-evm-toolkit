@@ -1,8 +1,7 @@
 {
-  "name": "virtual-hypercore",
-  "version": "0.0.1",
-  "private": true,
-  "description": "Deterministic offchain HyperCore virtual environment with CLOB and Anvil bridge",
+  "name": "@hyper-evm-toolkit/bridge",
+  "version": "0.1.0",
+  "description": "Level 3 TypeScript CLOB bridge for Hyperliquid EVM testing — async settlement with matching engine",
   "type": "module",
   "scripts": {
     "dev": "./scripts/run_with_npm_version.sh tsx watch src/index.ts",

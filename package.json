@@ -1,0 +1,33 @@
+{
+  "name": "hyper-evm-toolkit",
+  "version": "0.1.0",
+  "description": "Hyperliquid EVM testing toolkit — Solidity simulation (Level 1/2) + TypeScript CLOB bridge (Level 3)",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/endix-foundation-v1/hyper-evm-toolkit.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "bridge"
+  ],
+  "scripts": {
+    "build:sol": "forge build",
+    "test:sol": "forge test",
+    "build:bridge": "npm run build --workspace=bridge",
+    "test:bridge": "npm run test --workspace=bridge",
+    "build": "npm run build:sol && npm run build:bridge",
+    "test": "npm run test:sol && npm run test:bridge",
+    "typecheck": "npm run typecheck --workspace=bridge"
+  },
+  "keywords": [
+    "hyperliquid",
+    "evm",
+    "testing",
+    "defi",
+    "solidity",
+    "foundry",
+    "clob",
+    "bridge"
+  ]
+}
