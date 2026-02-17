@@ -159,6 +159,68 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
         );
     }
 
+    function test_applyBridgeActionResult_openStatusAllowsPartialFillAndRoundedQuote() public {
+        uint64 actionId = 94;
+        uint64 l1Block = 701;
+        uint128 cloid = 9002;
+
+        uint64 baseBefore = PrecompileLib.spotBalance(alice, BASE_TOKEN).total;
+        uint64 quoteBefore = PrecompileLib.spotBalance(alice, QUOTE_TOKEN).total;
+
+        // 0.75 quote per base, 2 base filled => 1 quote due to floor division
+        CoreSimulatorLib.applyBridgeActionResult(
+            actionId,
+            alice,
+            SPOT_INDEX,
+            false,
+            BASE_TOKEN,
+            QUOTE_TOKEN,
+            uint64(2),
+            uint64(75_000_000),
+            cloid,
+            uint8(HyperCore.BridgeActionStatus.OPEN),
+            uint8(HyperCore.BridgeReasonCode.NONE),
+            l1Block
+        );
+
+        assertEq(PrecompileLib.spotBalance(alice, BASE_TOKEN).total, baseBefore - 2);
+        assertEq(PrecompileLib.spotBalance(alice, QUOTE_TOKEN).total, quoteBefore + 1);
+
+        (uint8 status, uint8 reason, uint64 storedL1Block, uint64 filledAmount, uint64 executionPrice) =
+            hyperCore.getOrderOutcome(cloid);
+        assertEq(status, uint8(HyperCore.BridgeActionStatus.OPEN));
+        assertEq(reason, uint8(HyperCore.BridgeReasonCode.NONE));
+        assertEq(storedL1Block, l1Block);
+        assertEq(filledAmount, uint64(2));
+        assertEq(executionPrice, uint64(75_000_000));
+    }
+
+    function test_applyBridgeActionResult_buyDirectionWithSubOneQuoteResult() public {
+        uint64 actionId = 95;
+        uint64 l1Block = 702;
+        uint64 baseBefore = PrecompileLib.spotBalance(alice, BASE_TOKEN).total;
+        uint64 quoteBefore = PrecompileLib.spotBalance(alice, QUOTE_TOKEN).total;
+
+        // executionPrice below 1e8 keeps quoteAmount at zero after integer division
+        CoreSimulatorLib.applyBridgeActionResult(
+            actionId,
+            alice,
+            SPOT_INDEX,
+            true,
+            BASE_TOKEN,
+            QUOTE_TOKEN,
+            uint64(1),
+            uint64(75_000_000),
+            uint128(0),
+            uint8(HyperCore.BridgeActionStatus.PARTIAL_FILLED),
+            uint8(HyperCore.BridgeReasonCode.NONE),
+            l1Block
+        );
+
+        assertEq(PrecompileLib.spotBalance(alice, BASE_TOKEN).total, baseBefore + 1);
+        assertEq(PrecompileLib.spotBalance(alice, QUOTE_TOKEN).total, quoteBefore);
+    }
+
     function test_markBridgeActionProcessed_revertsOnNonTerminalStatus() public {
         vm.expectRevert(
             abi.encodeWithSelector(
