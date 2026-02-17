@@ -312,9 +312,17 @@ library CoreSimulatorLib {
             l1Block: order.l1Block
         });
 
+        // Preserve the raw _spotPrice before the bridge action overwrites it.
+        // applyBridgeActionResult writes `_spotPrice[spotIndex] = executionPrice`, but
+        // executionPrice is szDecimals-scaled (rawPx * 10^szDec) while _spotPrice stores
+        // raw values. Restore after execution to avoid corrupting readSpotPx().
+        uint64 rawPxBefore = hyperCore.readSpotPx(order.spotMarketId);
+
         success = _applyBridgeActionResultLowLevel(request);
-        // ADR-018 Rev 3: No spotPx correction needed — executionPrice is real market price.
-        // FIXME(phase2): handle weiDecimals!=8 spotPrice correction if needed.
+
+        // Restore raw _spotPrice — the bridge function's write assumed production format
+        // where executionPrice IS raw. In our simulator, it's pre-scaled for quoteAmount math.
+        hyperCore.setSpotPx(order.spotMarketId, rawPxBefore);
         return (true, success);
     }
 
@@ -370,18 +378,21 @@ library CoreSimulatorLib {
         return (true, spotPx);
     }
 
-    function _tryPrepareBridgeAmounts(bool /* isBuy */, uint64 sz, uint64 spotPx, uint8 baseWeiDecimals)
+    function _tryPrepareBridgeAmounts(bool /* isBuy */, uint64 sz, uint64 spotPx, uint8 /* baseWeiDecimals */)
         private
+        pure
         returns (bool hasAmounts, uint64 filledAmount, uint64 executionPrice)
     {
-        filledAmount = _scale(sz, 8, baseWeiDecimals);
+        // ADR-018 Rev 3: filledAmount stays in szDecimals (8-dec) — applyBridgeActionResult
+        // computes quoteAmount = (filledAmount * executionPrice) / 1e8, which assumes both
+        // values are in 8-decimal representation. Scaling to weiDecimals would break this.
+        filledAmount = sz;
         if (filledAmount == 0) {
             return (false, 0, 0);
         }
 
-        // ADR-018 Rev 3: Pass real market price. Fee computed inside applyBridgeActionResult.
-        // Scale price to match filledAmount's decimal representation.
-        executionPrice = SafeCast.toUint64((uint256(sz) * uint256(spotPx)) / uint256(filledAmount));
+        // Pass real market price directly. Fee is computed inside applyBridgeActionResult.
+        executionPrice = spotPx;
         if (executionPrice == 0) {
             return (false, 0, 0);
         }
@@ -490,18 +501,19 @@ library CoreSimulatorLib {
     }
 
     /**
-     * @notice Compatibility shim retained for legacy callers.
-     * @dev Forwards `mode` to the underlying CoreWriter simulation to preserve historical call paths.
-     *      ADR-018 processing still assumes queue-mode routing for raw actions.
-     * @param mode Target mode value for CoreWriter.
+     * @notice Deprecated — no-op. Retained for ABI backward compatibility only.
+     * @dev ADR-018 Rev 3: `sendRawAction()` always uses the QUEUE (ring-buffer) path
+     *      regardless of this setting. Calling this function has no behavioral effect.
+     * @param mode Target mode value (ignored — QUEUE is always active).
      */
     function setCoreWriterMode(CoreWriterSim.Mode mode) internal {
         coreWriter.setMode(mode);
     }
 
     /**
-     * @notice Compatibility shim retained for legacy callers.
-     * @dev Sets queue mode explicitly to align with ADR-018 default routing behavior.
+     * @notice Deprecated — no-op. QUEUE mode is now always active per ADR-018 Rev 3.
+     * @dev Retained for backward compatibility. Calling this function is harmless but
+     *      unnecessary — `sendRawAction()` always queues to the ring buffer.
      */
     function setCoreWriterQueueMode() internal {
         coreWriter.setMode(CoreWriterSim.Mode.QUEUE);

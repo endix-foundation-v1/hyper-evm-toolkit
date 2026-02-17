@@ -21,6 +21,9 @@ contract CoreWriterSim {
         uint256 value;
     }
 
+    /// @notice Deprecated — retained for ABI backward compatibility only.
+    /// After ADR-018 Rev 3, the SYNC/QUEUE distinction is removed.
+    /// `sendRawAction()` always uses the QUEUE (ring-buffer) path.
     enum Mode {
         SYNC,
         QUEUE
@@ -49,12 +52,18 @@ contract CoreWriterSim {
     /////// testing config
     /////////////////////////
     bool public revertOnFailure;
+
+    /// @notice Deprecated — retained for ABI backward compatibility only.
+    /// After ADR-018 Rev 3, `sendRawAction()` always uses the QUEUE (ring-buffer)
+    /// path regardless of this variable's value.
     Mode public mode;
 
     function setRevertOnFailure(bool _revertOnFailure) public {
         revertOnFailure = _revertOnFailure;
     }
 
+    /// @notice Deprecated — no-op. `sendRawAction()` always uses the QUEUE path
+    /// per ADR-018 Rev 3. Retained for ABI backward compatibility.
     function setMode(Mode newMode) public {
         mode = newMode;
     }
@@ -151,6 +160,11 @@ contract CoreWriterSim {
         enqueueAction(abi.encodeCall(CoreExecution.executeNativeTransfer, (sender, from, value)), value);
     }
 
+    /// @notice Enqueues a raw action to the ring buffer for deferred execution.
+    /// @dev ADR-018 Rev 3: Always uses the QUEUE (ring-buffer) path. The `mode`
+    /// variable is ignored — all actions are processed by `_autoApplyQueuedActions()`
+    /// inside `nextBlock()`, which routes spot orders through
+    /// `applyBridgeActionResult()` with fee-separated settlement.
     function sendRawAction(bytes calldata data) external {
         uint8 version = uint8(data[0]);
         require(version == 1);
@@ -159,32 +173,23 @@ contract CoreWriterSim {
 
         bytes memory payload = data[4:];
 
-        if (mode == Mode.QUEUE) {
-            if (_nextActionId == 0) {
-                _nextActionId = 1;
-            }
-
-            uint64 actionId = _nextActionId++;
-            uint64 l1Block = block.number.toUint64();
-
-            _queuedActions[_queueTail] = QueuedAction({
-                actionId: actionId,
-                sender: msg.sender,
-                kind: kind,
-                payload: payload,
-                l1Block: l1Block
-            });
-            _queueTail++;
-
-            emit ActionQueued(actionId, msg.sender, kind, l1Block, payload);
-            emit RawAction(msg.sender, data);
-            return;
+        if (_nextActionId == 0) {
+            _nextActionId = 1;
         }
 
-        bytes memory call = abi.encodeCall(HyperCore.executeRawAction, (msg.sender, kind, payload));
+        uint64 actionId = _nextActionId++;
+        uint64 l1Block = block.number.toUint64();
 
-        enqueueAction(block.timestamp, call, 0);
+        _queuedActions[_queueTail] = QueuedAction({
+            actionId: actionId,
+            sender: msg.sender,
+            kind: kind,
+            payload: payload,
+            l1Block: l1Block
+        });
+        _queueTail++;
 
+        emit ActionQueued(actionId, msg.sender, kind, l1Block, payload);
         emit RawAction(msg.sender, data);
     }
 }
