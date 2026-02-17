@@ -106,9 +106,14 @@ library CoreSimulatorLib {
     }
 
     /**
-     * @notice Advances the simulation by one block and replays pending bridge/system activity.
-     * @dev Processing order is callback queue -> ring buffer auto-apply via
-     *      _autoApplyQueuedActions (ADR-018 single-path routing) -> pending orders.
+     * @notice Advances the simulation by one block.
+     * @dev Processing order:
+     *   1. ERC20 transfers to system addresses (EVM->Core)
+     *   2. Block number + timestamp advance
+     *   3. Liquidate positions
+     *   4. Process callback queue (token/native transfers via priority queue)
+     *   5. Process ring buffer with ADR-018 auto-apply (spot→bridge, sends→spotSend, rest→rawAction)
+     *   6. Process pending orders
      * @param expectRevert If true, do not revert on action failures and instead return
      *        whether any queued action failed.
      */
@@ -160,9 +165,11 @@ library CoreSimulatorLib {
     }
 
     /**
-     * @notice Auto-applies queued CoreWriter actions using ADR-018 routing.
-     * @dev Route map: spot LIMIT_ORDER_ACTION with spot assets -> applyBridgeActionResult(FILLED);
-     *      SPOT_SEND_ACTION -> applySpotSendAction; all others -> executeRawAction fallback.
+     * @notice Drains queued ring-buffer actions and auto-applies them via ADR-018 routing.
+     * @dev Spot limit orders route through `applyBridgeActionResult(FILLED)` with fee-adjusted
+     *      execution price. Spot sends route through `applySpotSendAction()`. Everything else
+     *      (perps, vaults, staking, delegation, non-executable spot orders) falls back to
+     *      `executeRawAction()`.
      * @param expectRevert If true, treat execution failures as soft failures instead of revert.
      * @return anyFail True when any queued action execution fails.
      */
@@ -445,8 +452,8 @@ library CoreSimulatorLib {
     }
 
     /**
-     * @notice Mirrors HyperCore decimal scaling used by spot limit order math.
-     * @dev Matches the behavior of CoreExecution.scale.
+     * @notice Scales a uint64 amount between decimal representations.
+     * @dev Mirrors CoreExecution.scale() exactly for consistency.
      */
     function _scale(uint64 amount, uint8 fromDecimals, uint8 toDecimals) private pure returns (uint64) {
         if (fromDecimals == toDecimals) {
@@ -471,19 +478,18 @@ library CoreSimulatorLib {
     }
 
     /**
-     * @notice Sets the CoreWriter mode used by the underlying simulation contract.
-     * @dev Set via this method is deprecated because the ADR-018 path uses queue-based execution.
+     * @notice Compatibility shim retained for legacy callers.
+     * @dev Forwards `mode` to the underlying CoreWriter simulation to preserve historical call paths.
+     *      ADR-018 processing still assumes queue-mode routing for raw actions.
      * @param mode Target mode value for CoreWriter.
-     * @dev Deprecated: Queue-mode behavior is canonical for ADR-018; prefer keeping queue mode
-     *      active through setCoreWriterQueueMode for explicit intent.
      */
     function setCoreWriterMode(CoreWriterSim.Mode mode) internal {
         coreWriter.setMode(mode);
     }
 
     /**
-     * @notice Puts CoreWriter into queue mode.
-     * @dev Deprecated: CoreWriter queue mode is now the canonical ADR-018 default.
+     * @notice Compatibility shim retained for legacy callers.
+     * @dev Sets queue mode explicitly to align with ADR-018 default routing behavior.
      */
     function setCoreWriterQueueMode() internal {
         coreWriter.setMode(CoreWriterSim.Mode.QUEUE);
