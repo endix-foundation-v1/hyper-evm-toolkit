@@ -50,6 +50,19 @@ library CoreSimulatorLib {
         uint64 l1Block;
     }
 
+    struct PerpBridgeApplyRequest {
+        uint64 actionId;
+        address sender;
+        uint32 perpAsset;
+        bool isBuy;
+        uint64 limitPx;
+        uint64 sz;
+        bool reduceOnly;
+        uint8 tif;
+        uint128 cloid;
+        uint64 l1Block;
+    }
+
     struct DeferredSpotOrder {
         uint64 actionId;
         address sender;
@@ -188,8 +201,10 @@ library CoreSimulatorLib {
     /**
      * @notice Drains queued ring-buffer actions and auto-applies them via ADR-018 routing.
      * @dev Spot limit orders route through `applyBridgeActionResult(FILLED)` with market
-     *      execution price. Spot sends route through `applySpotSendAction()`. Everything else
-     *      (perps, vaults, staking, delegation) falls back to `executeRawAction()`.
+     *      execution price. Spot sends route through `applySpotSendAction()`. Perp limit
+     *      orders route through a dedicated bridge extension point that currently forwards to
+     *      `executeRawAction()`. Everything else (vaults, staking, delegation) falls back to
+     *      `executeRawAction()`.
      * @param expectRevert If true, treat execution failures as soft failures instead of revert.
      * @return anyFail True when any queued action execution fails.
      */
@@ -214,6 +229,12 @@ library CoreSimulatorLib {
                 if (handled) {
                     shouldExecuteRawAction = false;
                     success = routeSuccess;
+                } else {
+                    (handled, routeSuccess) = _tryApplyPerpLimitOrderAction(action);
+                    if (handled) {
+                        shouldExecuteRawAction = false;
+                        success = routeSuccess;
+                    }
                 }
             } else if (action.kind == HLConstants.SPOT_SEND_ACTION) {
                 (bool handled, bool routeSuccess) = _tryApplySpotSendAction(action);
@@ -267,6 +288,39 @@ library CoreSimulatorLib {
         }
 
         return (true, routeSuccess);
+    }
+
+    function _tryApplyPerpLimitOrderAction(CoreWriterSim.QueuedAction memory action)
+        private
+        returns (bool handled, bool success)
+    {
+        (bool decoded, uint32 perpAsset, bool isBuy, uint64 limitPx, uint64 sz, bool reduceOnly, uint8 tif, uint128 cloid)
+        = _decodePerpLimitOrderPayload(action.payload);
+        if (!decoded) {
+            return (false, false);
+        }
+
+        PerpBridgeApplyRequest memory request = PerpBridgeApplyRequest({
+            actionId: action.actionId,
+            sender: action.sender,
+            perpAsset: perpAsset,
+            isBuy: isBuy,
+            limitPx: limitPx,
+            sz: sz,
+            reduceOnly: reduceOnly,
+            tif: tif,
+            cloid: cloid,
+            l1Block: action.l1Block
+        });
+
+        // TODO: ADR-018 Rev 4 - perp bridge settlement.
+        // Route via executeRawAction -> executePerpLimitOrder for now, then replace with explicit
+        // consume/apply bridge settlement once perp bridge outcomes are modeled.
+        (success,) = address(hyperCore).call(
+            abi.encodeCall(HyperCore.executeRawAction, (request.sender, action.kind, action.payload))
+        );
+
+        return (true, success);
     }
 
     function _deferOrder(DeferredSpotOrder memory order) private {
@@ -361,6 +415,35 @@ library CoreSimulatorLib {
 
         spotMarketId = asset - 10000;
         return (true, spotMarketId, isBuy, limitPx, sz, cloid);
+    }
+
+    function _decodePerpLimitOrderPayload(bytes memory payload)
+        private
+        pure
+        returns (
+            bool decoded,
+            uint32 perpAsset,
+            bool isBuy,
+            uint64 limitPx,
+            uint64 sz,
+            bool reduceOnly,
+            uint8 tif,
+            uint128 cloid
+        )
+    {
+        if (payload.length != 224) {
+            return (false, 0, false, 0, 0, false, 0, 0);
+        }
+
+        (perpAsset, isBuy, limitPx, sz, reduceOnly, tif, cloid) =
+            abi.decode(payload, (uint32, bool, uint64, uint64, bool, uint8, uint128));
+
+        bool isPerpAsset = perpAsset < 1e4 || perpAsset >= 1e5;
+        if (!isPerpAsset || sz == 0) {
+            return (false, 0, false, 0, 0, false, 0, 0);
+        }
+
+        return (true, perpAsset, isBuy, limitPx, sz, reduceOnly, tif, cloid);
     }
 
     function _tryGetSpotPxForBridge(uint32 spotMarketId, uint8 baseSzDecimals)
@@ -538,6 +621,110 @@ library CoreSimulatorLib {
 
     function consumeQueuedActions(uint256 count) internal {
         coreWriter.consumeQueuedActions(count);
+    }
+
+    /// @notice Consume all queued actions and return them for manual application
+    function consumeAllAndReturn() internal returns (CoreWriterSim.QueuedAction[] memory actions) {
+        uint256 queueLength = coreWriter.getQueueLength();
+        if (queueLength == 0) {
+            return new CoreWriterSim.QueuedAction[](0);
+        }
+
+        actions = coreWriter.getQueuedActions(0, queueLength);
+        coreWriter.consumeQueuedActions(queueLength);
+    }
+
+    /// @notice Apply a FILLED outcome for a spot order with market price
+    function applyFilledSpotOrder(CoreWriterSim.QueuedAction memory action, uint64 executionPrice) internal {
+        (BridgeApplyRequest memory request, uint64 orderSize) = _parseSpotBridgeAction(action);
+
+        hyperCore.applyBridgeActionResult(
+            request.actionId,
+            request.sender,
+            request.spotMarketId,
+            request.isBuy,
+            request.baseToken,
+            request.quoteToken,
+            orderSize,
+            executionPrice,
+            request.cloid,
+            uint8(HyperCore.BridgeActionStatus.FILLED),
+            uint8(HyperCore.BridgeReasonCode.NONE),
+            request.l1Block
+        );
+    }
+
+    /// @notice Apply a REJECTED outcome for a queued action
+    function applyRejectedAction(CoreWriterSim.QueuedAction memory action, uint8 reason) internal {
+        (BridgeApplyRequest memory request,) = _parseSpotBridgeAction(action);
+
+        hyperCore.markBridgeActionProcessed(
+            request.actionId, uint8(HyperCore.BridgeActionStatus.REJECTED), reason, request.l1Block, request.cloid
+        );
+    }
+
+    /// @notice Apply a PARTIAL_FILLED outcome
+    function applyPartialFilledSpotOrder(
+        CoreWriterSim.QueuedAction memory action,
+        uint64 filledAmount,
+        uint64 executionPrice
+    ) internal {
+        (BridgeApplyRequest memory request, uint64 orderSize) = _parseSpotBridgeAction(action);
+        require(filledAmount <= orderSize, "filledAmount exceeds order size");
+
+        hyperCore.applyBridgeActionResult(
+            request.actionId,
+            request.sender,
+            request.spotMarketId,
+            request.isBuy,
+            request.baseToken,
+            request.quoteToken,
+            filledAmount,
+            executionPrice,
+            request.cloid,
+            uint8(HyperCore.BridgeActionStatus.PARTIAL_FILLED),
+            uint8(HyperCore.BridgeReasonCode.NONE),
+            request.l1Block
+        );
+    }
+
+    /// @notice Apply an ERROR outcome
+    function applyErrorAction(CoreWriterSim.QueuedAction memory action, uint8 reason) internal {
+        (BridgeApplyRequest memory request,) = _parseSpotBridgeAction(action);
+
+        hyperCore.markBridgeActionProcessed(
+            request.actionId, uint8(HyperCore.BridgeActionStatus.ERROR), reason, request.l1Block, request.cloid
+        );
+    }
+
+    function _parseSpotBridgeAction(CoreWriterSim.QueuedAction memory action)
+        private
+        view
+        returns (BridgeApplyRequest memory request, uint64 orderSize)
+    {
+        require(action.kind == HLConstants.LIMIT_ORDER_ACTION, "invalid action kind");
+
+        (bool decoded, uint32 spotMarketId, bool isBuy,, uint64 sz, uint128 cloid) =
+            _decodeSpotLimitOrderPayload(action.payload);
+        require(decoded, "invalid spot order payload");
+
+        (bool lookupSuccess, SpotTokenInfo memory spotTokenInfo) = _tryReadSpotAndBaseTokenInfo(spotMarketId);
+        require(lookupSuccess, "spot market metadata missing");
+
+        request = BridgeApplyRequest({
+            actionId: action.actionId,
+            sender: action.sender,
+            spotMarketId: spotMarketId,
+            isBuy: isBuy,
+            baseToken: spotTokenInfo.baseToken,
+            quoteToken: spotTokenInfo.quoteToken,
+            filledAmount: 0,
+            executionPrice: 0,
+            cloid: cloid,
+            l1Block: action.l1Block
+        });
+
+        orderSize = sz;
     }
 
     function applyBridgeActionResult(
