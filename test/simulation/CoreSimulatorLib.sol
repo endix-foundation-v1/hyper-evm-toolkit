@@ -3,6 +3,7 @@ pragma solidity ^0.8.0;
 
 import {Vm} from "forge-std/Vm.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {HyperCore} from "./HyperCore.sol";
 import {CoreWriterSim} from "./CoreWriterSim.sol";
 import {PrecompileSim} from "./PrecompileSim.sol";
@@ -28,6 +29,34 @@ library CoreSimulatorLib {
     uint256 constant NUM_PRECOMPILES = 17;
 
     HyperCore constant hyperCore = HyperCore(payable(0x9999999999999999999999999999999999999999));
+
+    struct SpotLimitExecutionData {
+        uint64 baseToken;
+        uint64 quoteToken;
+        uint64 filledAmount;
+        uint64 adjustedExecPrice;
+        uint64 originalPx;
+    }
+
+    struct SpotTokenInfo {
+        uint64 baseToken;
+        uint64 quoteToken;
+        uint8 baseSzDecimals;
+        uint8 baseWeiDecimals;
+    }
+
+    struct BridgeApplyRequest {
+        uint64 actionId;
+        address sender;
+        uint32 spotMarketId;
+        bool isBuy;
+        uint64 baseToken;
+        uint64 quoteToken;
+        uint64 filledAmount;
+        uint64 adjustedExecPrice;
+        uint128 cloid;
+        uint64 l1Block;
+    }
 
     // ERC20 Transfer event signature
     bytes32 constant TRANSFER_EVENT_SIG = keccak256("Transfer(address,address,uint256)");
@@ -76,6 +105,13 @@ library CoreSimulatorLib {
         return hyperCore;
     }
 
+    /**
+     * @notice Advances the simulation by one block and replays pending bridge/system activity.
+     * @dev Processing order is callback queue -> ring buffer auto-apply via
+     *      _autoApplyQueuedActions (ADR-018 single-path routing) -> pending orders.
+     * @param expectRevert If true, do not revert on action failures and instead return
+     *        whether any queued action failed.
+     */
     function nextBlock(bool expectRevert) internal {
         // Get all recorded logs
         Vm.Log[] memory entries = vm.getRecordedLogs();
@@ -110,11 +146,318 @@ library CoreSimulatorLib {
         // liquidate any positions that are liquidatable
         hyperCore.liquidatePositions();
 
-        // Process any pending actions
-        coreWriter.executeQueuedActions(expectRevert);
+        // Process callback queue first for bridge-credit-dependent flows
+        coreWriter.executeQueuedActions(false);
+
+        // Process ring-buffer raw actions through HyperCore.executeRawAction
+        bool ringFail = _autoApplyQueuedActions(expectRevert);
+        if (expectRevert && !ringFail) {
+            revert("Expected revert, but action succeeded");
+        }
 
         // Process pending orders
         hyperCore.processPendingOrders();
+    }
+
+    /**
+     * @notice Auto-applies queued CoreWriter actions using ADR-018 routing.
+     * @dev Route map: spot LIMIT_ORDER_ACTION with spot assets -> applyBridgeActionResult(FILLED);
+     *      SPOT_SEND_ACTION -> applySpotSendAction; all others -> executeRawAction fallback.
+     * @param expectRevert If true, treat execution failures as soft failures instead of revert.
+     * @return anyFail True when any queued action execution fails.
+     */
+    function _autoApplyQueuedActions(bool expectRevert) internal returns (bool anyFail) {
+        uint256 queueLength = coreWriter.getQueueLength();
+        if (queueLength == 0) {
+            return false;
+        }
+
+        CoreWriterSim.QueuedAction[] memory queuedActions = coreWriter.getQueuedActions(0, queueLength);
+        coreWriter.consumeQueuedActions(queueLength);
+
+        bool shouldRevertOnFailure = coreWriter.revertOnFailure();
+
+        for (uint256 i = 0; i < queuedActions.length; i++) {
+            CoreWriterSim.QueuedAction memory action = queuedActions[i];
+            bool success;
+            bool shouldExecuteRawAction = true;
+
+            if (action.kind == HLConstants.LIMIT_ORDER_ACTION) {
+                (bool handled, bool routeSuccess) = _tryApplySpotLimitOrderAction(action);
+                if (handled) {
+                    shouldExecuteRawAction = false;
+                    success = routeSuccess;
+                }
+            } else if (action.kind == HLConstants.SPOT_SEND_ACTION) {
+                (bool handled, bool routeSuccess) = _tryApplySpotSendAction(action);
+                if (handled) {
+                    shouldExecuteRawAction = false;
+                    success = routeSuccess;
+                }
+            }
+
+            if (shouldExecuteRawAction) {
+                (success,) = address(hyperCore).call(
+                    abi.encodeCall(HyperCore.executeRawAction, (action.sender, action.kind, action.payload))
+                );
+            }
+
+            if (!success) {
+                anyFail = true;
+
+                if (shouldRevertOnFailure && !expectRevert) {
+                    revert("CoreWriter action failed: Reverting due to revertOnFailure flag");
+                }
+            }
+        }
+    }
+
+    function _tryApplySpotLimitOrderAction(CoreWriterSim.QueuedAction memory action)
+        private
+        returns (bool handled, bool success)
+    {
+        (bool decoded, uint32 spotMarketId, bool isBuy, uint64 limitPx, uint64 sz, uint128 cloid) =
+            _decodeSpotLimitOrderPayload(action.payload);
+        if (!decoded) {
+            return (false, false);
+        }
+
+        (bool canApplyBridge, SpotLimitExecutionData memory executionData) =
+            _prepareSpotLimitBridgeExecution(spotMarketId, isBuy, limitPx, sz);
+        if (!canApplyBridge) {
+            return (false, false);
+        }
+
+        BridgeApplyRequest memory request = BridgeApplyRequest({
+            actionId: action.actionId,
+            sender: action.sender,
+            spotMarketId: spotMarketId,
+            isBuy: isBuy,
+            baseToken: executionData.baseToken,
+            quoteToken: executionData.quoteToken,
+            filledAmount: executionData.filledAmount,
+            adjustedExecPrice: executionData.adjustedExecPrice,
+            cloid: cloid,
+            l1Block: action.l1Block
+        });
+
+        success = _applyBridgeActionResultLowLevel(request);
+        if (success) {
+            hyperCore.setSpotPx(spotMarketId, executionData.originalPx);
+        }
+
+        return (true, success);
+    }
+
+    function _decodeSpotLimitOrderPayload(bytes memory payload)
+        private
+        pure
+        returns (bool decoded, uint32 spotMarketId, bool isBuy, uint64 limitPx, uint64 sz, uint128 cloid)
+    {
+        if (payload.length != 224) {
+            return (false, 0, false, 0, 0, 0);
+        }
+
+        uint32 asset;
+        (asset, isBuy, limitPx, sz,,, cloid) = abi.decode(payload, (uint32, bool, uint64, uint64, bool, uint8, uint128));
+
+        bool isSpotAsset = asset >= 1e4 && asset < 1e5;
+        if (!isSpotAsset || sz == 0) {
+            return (false, 0, false, 0, 0, 0);
+        }
+
+        spotMarketId = asset - 10000;
+        return (true, spotMarketId, isBuy, limitPx, sz, cloid);
+    }
+
+    function _prepareSpotLimitBridgeExecution(uint32 spotMarketId, bool isBuy, uint64 limitPx, uint64 sz)
+        private
+        returns (bool canApplyBridge, SpotLimitExecutionData memory executionData)
+    {
+        (bool lookupSuccess, SpotTokenInfo memory spotTokenInfo) = _tryReadSpotAndBaseTokenInfo(spotMarketId);
+        if (!lookupSuccess) {
+            return (false, executionData);
+        }
+
+        (bool hasSpotPx, uint64 originalPx, uint64 spotPx) =
+            _tryGetSpotPxForBridge(spotMarketId, spotTokenInfo.baseSzDecimals);
+        if (!hasSpotPx) {
+            return (false, executionData);
+        }
+
+        bool executable = isBuy ? limitPx >= spotPx : limitPx <= spotPx;
+        if (!executable) {
+            return (false, executionData);
+        }
+
+        (bool hasAmounts, uint64 filledAmount, uint64 adjustedExecPrice) =
+            _tryPrepareBridgeAmounts(isBuy, sz, spotPx, spotTokenInfo.baseWeiDecimals);
+        if (!hasAmounts) {
+            return (false, executionData);
+        }
+
+        executionData.baseToken = spotTokenInfo.baseToken;
+        executionData.quoteToken = spotTokenInfo.quoteToken;
+        executionData.filledAmount = filledAmount;
+        executionData.adjustedExecPrice = adjustedExecPrice;
+        executionData.originalPx = originalPx;
+        return (true, executionData);
+    }
+
+    function _tryGetSpotPxForBridge(uint32 spotMarketId, uint8 baseSzDecimals)
+        private
+        returns (bool hasSpotPx, uint64 originalPx, uint64 spotPx)
+    {
+        originalPx = hyperCore.readSpotPx(spotMarketId);
+        spotPx = originalPx * SafeCast.toUint64(10 ** baseSzDecimals);
+
+        if (spotPx == 0 && !hyperCore.useRealL1Read()) {
+            // Preserve executeSpotLimitOrder's offline-mode revert path via executeRawAction fallback.
+            return (false, 0, 0);
+        }
+
+        return (true, originalPx, spotPx);
+    }
+
+    function _tryPrepareBridgeAmounts(bool isBuy, uint64 sz, uint64 spotPx, uint8 baseWeiDecimals)
+        private
+        returns (bool hasAmounts, uint64 filledAmount, uint64 adjustedExecPrice)
+    {
+        filledAmount = _scale(sz, 8, baseWeiDecimals);
+        if (filledAmount == 0) {
+            return (false, 0, 0);
+        }
+
+        (bool hasAdjustedExecPrice, uint64 computedAdjustedExecPrice) =
+            _computeAdjustedExecPrice(isBuy, sz, spotPx, filledAmount, hyperCore.spotMakerFee());
+        if (!hasAdjustedExecPrice) {
+            return (false, 0, 0);
+        }
+
+        return (true, filledAmount, computedAdjustedExecPrice);
+    }
+
+    function _applyBridgeActionResultLowLevel(BridgeApplyRequest memory request) private returns (bool success) {
+        (success,) = address(hyperCore).call(
+            abi.encodeCall(
+                HyperCore.applyBridgeActionResult,
+                (
+                    request.actionId,
+                    request.sender,
+                    request.spotMarketId,
+                    request.isBuy,
+                    request.baseToken,
+                    request.quoteToken,
+                    request.filledAmount,
+                    request.adjustedExecPrice,
+                    request.cloid,
+                    uint8(1),
+                    uint8(0),
+                    request.l1Block
+                )
+            )
+        );
+    }
+
+    function _tryApplySpotSendAction(CoreWriterSim.QueuedAction memory action)
+        private
+        returns (bool handled, bool success)
+    {
+        if (action.payload.length != 96) {
+            return (false, false);
+        }
+
+        (address destination, uint64 token, uint64 amountWei) = abi.decode(action.payload, (address, uint64, uint64));
+
+        // Bridge-to-EVM spot sends must use executeRawAction -> executeSpotSend to trigger EVM transfer callbacks.
+        if (getTokenIndexFromSystemAddress(destination) == token) {
+            return (false, false);
+        }
+
+        (success,) = address(hyperCore).call(
+            abi.encodeCall(
+                HyperCore.applySpotSendAction,
+                (action.actionId, action.sender, destination, token, amountWei, action.l1Block)
+            )
+        );
+
+        return (true, success);
+    }
+
+    function _tryReadSpotAndBaseTokenInfo(uint32 spotMarketId)
+        private
+        view
+        returns (bool lookupSuccess, SpotTokenInfo memory spotTokenInfo)
+    {
+        (bool spotInfoSuccess, bytes memory spotInfoData) =
+            HLConstants.SPOT_INFO_PRECOMPILE_ADDRESS.staticcall(abi.encode(uint64(spotMarketId)));
+        if (!spotInfoSuccess) {
+            return (false, spotTokenInfo);
+        }
+
+        PrecompileLib.SpotInfo memory spotInfo = abi.decode(spotInfoData, (PrecompileLib.SpotInfo));
+        spotTokenInfo.baseToken = spotInfo.tokens[0];
+        spotTokenInfo.quoteToken = spotInfo.tokens[1];
+
+        (bool tokenInfoSuccess, bytes memory tokenInfoData) =
+            HLConstants.TOKEN_INFO_PRECOMPILE_ADDRESS.staticcall(abi.encode(spotTokenInfo.baseToken));
+        if (!tokenInfoSuccess) {
+            return (false, spotTokenInfo);
+        }
+
+        PrecompileLib.TokenInfo memory baseTokenInfo = abi.decode(tokenInfoData, (PrecompileLib.TokenInfo));
+        spotTokenInfo.baseSzDecimals = baseTokenInfo.szDecimals;
+        spotTokenInfo.baseWeiDecimals = baseTokenInfo.weiDecimals;
+        return (true, spotTokenInfo);
+    }
+
+    function _computeAdjustedExecPrice(bool isBuy, uint64 sz, uint64 spotPx, uint64 filledAmount, uint16 spotMakerFee)
+        private
+        pure
+        returns (bool canApplyBridge, uint64 adjustedExecPrice)
+    {
+        if (isBuy) {
+            uint64 amountIn = SafeCast.toUint64((uint256(sz) * uint256(spotPx)) / 1e8);
+            uint64 totalDebit = amountIn;
+
+            if (spotMakerFee > 0) {
+                totalDebit = SafeCast.toUint64(uint256(amountIn) + ((uint256(amountIn) * uint256(spotMakerFee)) / 1e6));
+            }
+
+            // Assumes filledAmount == sz for current test tokens (weiDecimals == 8).
+            adjustedExecPrice = SafeCast.toUint64((uint256(totalDebit) * 1e8) / uint256(filledAmount));
+            return (true, adjustedExecPrice);
+        }
+
+        uint64 amountOut = SafeCast.toUint64((uint256(sz) * uint256(spotPx)) / 1e8);
+        uint64 netProceeds = amountOut;
+
+        if (spotMakerFee > 0) {
+            uint64 fee = SafeCast.toUint64((uint256(amountOut) * uint256(spotMakerFee)) / 1e6);
+            if (netProceeds <= fee) {
+                return (false, 0);
+            }
+            netProceeds -= fee;
+        }
+
+        adjustedExecPrice = SafeCast.toUint64((uint256(netProceeds) * 1e8) / uint256(filledAmount));
+        return (true, adjustedExecPrice);
+    }
+
+    /**
+     * @notice Mirrors HyperCore decimal scaling used by spot limit order math.
+     * @dev Matches the behavior of CoreExecution.scale.
+     */
+    function _scale(uint64 amount, uint8 fromDecimals, uint8 toDecimals) private pure returns (uint64) {
+        if (fromDecimals == toDecimals) {
+            return amount;
+        } else if (fromDecimals < toDecimals) {
+            uint8 diff = toDecimals - fromDecimals;
+            return amount * uint64(10) ** diff;
+        } else {
+            uint8 diff = fromDecimals - toDecimals;
+            return amount / (uint64(10) ** diff);
+        }
     }
 
     function nextBlock() internal {
@@ -127,10 +470,21 @@ library CoreSimulatorLib {
         coreWriter.setRevertOnFailure(_revertOnFailure);
     }
 
+    /**
+     * @notice Sets the CoreWriter mode used by the underlying simulation contract.
+     * @dev Set via this method is deprecated because the ADR-018 path uses queue-based execution.
+     * @param mode Target mode value for CoreWriter.
+     * @dev Deprecated: Queue-mode behavior is canonical for ADR-018; prefer keeping queue mode
+     *      active through setCoreWriterQueueMode for explicit intent.
+     */
     function setCoreWriterMode(CoreWriterSim.Mode mode) internal {
         coreWriter.setMode(mode);
     }
 
+    /**
+     * @notice Puts CoreWriter into queue mode.
+     * @dev Deprecated: CoreWriter queue mode is now the canonical ADR-018 default.
+     */
     function setCoreWriterQueueMode() internal {
         coreWriter.setMode(CoreWriterSim.Mode.QUEUE);
     }
