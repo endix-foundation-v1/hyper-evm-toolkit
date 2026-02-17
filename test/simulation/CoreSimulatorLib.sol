@@ -63,6 +63,19 @@ library CoreSimulatorLib {
         uint64 l1Block;
     }
 
+    struct DeferredPerpOrder {
+        uint64 actionId;
+        address sender;
+        uint32 perpAsset;
+        bool isBuy;
+        uint64 limitPx;
+        uint64 sz;
+        bool reduceOnly;
+        uint8 tif;
+        uint128 cloid;
+        uint64 l1Block;
+    }
+
     struct DeferredSpotOrder {
         uint64 actionId;
         address sender;
@@ -79,13 +92,25 @@ library CoreSimulatorLib {
 
     // Storage slot for deferred orders (libraries cannot have state variables)
     bytes32 private constant DEFERRED_ORDERS_SLOT = keccak256("CoreSimulatorLib.deferredSpotOrders");
+    bytes32 private constant DEFERRED_PERP_ORDERS_SLOT = keccak256("CoreSimulatorLib.deferredPerpOrders");
 
     struct DeferredOrdersStorage {
         DeferredSpotOrder[] orders;
     }
 
+    struct DeferredPerpOrdersStorage {
+        DeferredPerpOrder[] orders;
+    }
+
     function _getDeferredOrdersStorage() private pure returns (DeferredOrdersStorage storage s) {
         bytes32 slot = DEFERRED_ORDERS_SLOT;
+        assembly {
+            s.slot := slot
+        }
+    }
+
+    function _getDeferredPerpOrdersStorage() private pure returns (DeferredPerpOrdersStorage storage s) {
+        bytes32 slot = DEFERRED_PERP_ORDERS_SLOT;
         assembly {
             s.slot := slot
         }
@@ -184,6 +209,7 @@ library CoreSimulatorLib {
 
         // Check deferred orders from previous blocks against updated prices
         _checkDeferredOrders();
+        _checkDeferredPerpOrders();
 
         // Process callback queue first for bridge-credit-dependent flows
         coreWriter.executeQueuedActions(false);
@@ -300,7 +326,7 @@ library CoreSimulatorLib {
             return (false, false);
         }
 
-        PerpBridgeApplyRequest memory request = PerpBridgeApplyRequest({
+        DeferredPerpOrder memory order = DeferredPerpOrder({
             actionId: action.actionId,
             sender: action.sender,
             perpAsset: perpAsset,
@@ -313,19 +339,23 @@ library CoreSimulatorLib {
             l1Block: action.l1Block
         });
 
-        // TODO: ADR-018 Rev 4 - perp bridge settlement.
-        // Route via executeRawAction -> executePerpLimitOrder for now, then replace with explicit
-        // consume/apply bridge settlement once perp bridge outcomes are modeled.
-        (success,) = address(hyperCore).call(
-            abi.encodeCall(HyperCore.executeRawAction, (request.sender, action.kind, action.payload))
-        );
+        (bool canExecuteNow, bool routeSuccess) = _tryExecuteDeferredPerpOrder(order);
+        if (!canExecuteNow) {
+            _deferPerpOrder(order);
+            return (true, true);
+        }
 
-        return (true, success);
+        return (true, routeSuccess);
     }
 
     function _deferOrder(DeferredSpotOrder memory order) private {
         DeferredOrdersStorage storage dos = _getDeferredOrdersStorage();
         dos.orders.push(order);
+    }
+
+    function _deferPerpOrder(DeferredPerpOrder memory order) private {
+        DeferredPerpOrdersStorage storage dps = _getDeferredPerpOrdersStorage();
+        dps.orders.push(order);
     }
 
     function _tryExecuteDeferredSpotOrder(DeferredSpotOrder memory order)
@@ -394,6 +424,106 @@ library CoreSimulatorLib {
                 i++;
             }
         }
+    }
+
+    function _tryExecuteDeferredPerpOrder(DeferredPerpOrder memory order)
+        private
+        returns (bool canExecuteNow, bool success)
+    {
+        // Check mark price availability and limit price executability
+        uint64 rawMarkPx = hyperCore.readMarkPx(uint16(order.perpAsset));
+        if (rawMarkPx == 0 && !hyperCore.useRealL1Read()) {
+            return (false, true);
+        }
+
+        {
+            uint64 normalizedMarkPx = rawMarkPx * 100;
+            bool executable = order.isBuy
+                ? normalizedMarkPx <= order.limitPx
+                : normalizedMarkPx >= order.limitPx;
+            if (!executable) {
+                return (false, true);
+            }
+        }
+
+        // Scale sz and apply
+        uint64 scaledSz = _scalePerpSz(order.perpAsset, order.sz);
+        if (scaledSz == 0) {
+            return (false, true);
+        }
+
+        success = _applyPerpBridgeActionResultLowLevel(
+            order.actionId, order.sender, order.perpAsset, order.isBuy,
+            scaledSz, rawMarkPx, order.cloid, order.l1Block
+        );
+
+        return (true, success);
+    }
+
+    function _scalePerpSz(uint32 perpAsset, uint64 sz) private view returns (uint64) {
+        (bool hasSzDec, uint8 szDecimals) = _tryGetPerpSzDecimals(perpAsset);
+        if (!hasSzDec) return 0;
+        return _scale(sz, 8, szDecimals);
+    }
+
+    function _checkDeferredPerpOrders() internal {
+        DeferredPerpOrdersStorage storage dps = _getDeferredPerpOrdersStorage();
+        uint256 i = 0;
+        while (i < dps.orders.length) {
+            DeferredPerpOrder memory order = dps.orders[i];
+
+            (bool canExecuteNow, bool success) = _tryExecuteDeferredPerpOrder(order);
+            if (canExecuteNow && success) {
+                dps.orders[i] = dps.orders[dps.orders.length - 1];
+                dps.orders.pop();
+            } else {
+                i++;
+            }
+        }
+    }
+
+    function _tryGetPerpSzDecimals(uint32 perpAsset) private view returns (bool hasSzDec, uint8 szDecimals) {
+        (bool perpInfoSuccess, bytes memory perpInfoData) =
+            HLConstants.PERP_ASSET_INFO_PRECOMPILE_ADDRESS.staticcall(abi.encode(uint64(perpAsset)));
+        if (!perpInfoSuccess) {
+            return (false, 0);
+        }
+
+        PrecompileLib.PerpAssetInfo memory perpInfo = abi.decode(perpInfoData, (PrecompileLib.PerpAssetInfo));
+        if (perpInfo.maxLeverage == 0) {
+            return (false, 0);
+        }
+
+        return (true, perpInfo.szDecimals);
+    }
+
+    function _applyPerpBridgeActionResultLowLevel(
+        uint64 actionId,
+        address sender,
+        uint32 perpAsset,
+        bool isBuy,
+        uint64 filledSz,
+        uint64 executionPrice,
+        uint128 cloid,
+        uint64 l1Block
+    ) private returns (bool success) {
+        (success,) = address(hyperCore).call(
+            abi.encodeCall(
+                HyperCore.applyPerpBridgeActionResult,
+                (
+                    actionId,
+                    sender,
+                    perpAsset,
+                    isBuy,
+                    filledSz,
+                    executionPrice,
+                    cloid,
+                    uint8(1), // FILLED
+                    uint8(0), // NONE
+                    l1Block
+                )
+            )
+        );
     }
 
     function _decodeSpotLimitOrderPayload(bytes memory payload)
@@ -611,6 +741,11 @@ library CoreSimulatorLib {
         return dos.orders.length;
     }
 
+    function getDeferredPerpOrderCount() internal view returns (uint256) {
+        DeferredPerpOrdersStorage storage dps = _getDeferredPerpOrdersStorage();
+        return dps.orders.length;
+    }
+
     function getQueuedActions(uint256 offset, uint256 limit)
         internal
         view
@@ -694,6 +829,126 @@ library CoreSimulatorLib {
 
         hyperCore.markBridgeActionProcessed(
             request.actionId, uint8(HyperCore.BridgeActionStatus.ERROR), reason, request.l1Block, request.cloid
+        );
+    }
+
+    /// @notice Apply a FILLED outcome for a perp order with explicit execution price.
+    /// @param action The queued action from consumeAllAndReturn().
+    /// @param executionPrice The price at which the order was filled.
+    function applyFilledPerpOrder(CoreWriterSim.QueuedAction memory action, uint64 executionPrice) internal {
+        (PerpBridgeApplyRequest memory request,, uint64 scaledSz) = _parsePerpBridgeAction(action);
+
+        hyperCore.applyPerpBridgeActionResult(
+            request.actionId,
+            request.sender,
+            request.perpAsset,
+            request.isBuy,
+            scaledSz,
+            executionPrice,
+            request.cloid,
+            uint8(HyperCore.BridgeActionStatus.FILLED),
+            uint8(HyperCore.BridgeReasonCode.NONE),
+            request.l1Block
+        );
+    }
+
+    /// @notice Apply a PARTIAL_FILLED outcome for a perp order.
+    /// @param filledSz Filled size in CoreWriter 8-dec format (same units as the order placement).
+    function applyPartialFilledPerpOrder(
+        CoreWriterSim.QueuedAction memory action,
+        uint64 filledSz,
+        uint64 executionPrice
+    ) internal {
+        (PerpBridgeApplyRequest memory request, uint64 rawOrderSz, ) = _parsePerpBridgeAction(action);
+        require(filledSz <= rawOrderSz, "filledSz exceeds order size");
+
+        // Scale filledSz from 8-dec to szDecimals (same as full order scaling)
+        uint64 scaledFilled = _scalePerpSz(request.perpAsset, filledSz);
+
+        hyperCore.applyPerpBridgeActionResult(
+            request.actionId,
+            request.sender,
+            request.perpAsset,
+            request.isBuy,
+            scaledFilled,
+            executionPrice,
+            request.cloid,
+            uint8(HyperCore.BridgeActionStatus.PARTIAL_FILLED),
+            uint8(HyperCore.BridgeReasonCode.NONE),
+            request.l1Block
+        );
+    }
+
+    /// @notice Apply a REJECTED outcome for a perp order.
+    function applyRejectedPerpAction(CoreWriterSim.QueuedAction memory action, uint8 reason) internal {
+        (PerpBridgeApplyRequest memory request,,) = _parsePerpBridgeAction(action);
+
+        hyperCore.markBridgeActionProcessed(
+            request.actionId, uint8(HyperCore.BridgeActionStatus.REJECTED), reason, request.l1Block, request.cloid
+        );
+    }
+
+    /// @notice Apply an ERROR outcome for a perp order.
+    function applyErrorPerpAction(CoreWriterSim.QueuedAction memory action, uint8 reason) internal {
+        (PerpBridgeApplyRequest memory request,,) = _parsePerpBridgeAction(action);
+
+        hyperCore.markBridgeActionProcessed(
+            request.actionId, uint8(HyperCore.BridgeActionStatus.ERROR), reason, request.l1Block, request.cloid
+        );
+    }
+
+    /// @notice Decode a queued perp limit order action into a PerpBridgeApplyRequest.
+    /// @return request The parsed request with metadata.
+    /// @return rawOrderSz The order size in CoreWriter 8-dec format.
+    /// @return scaledOrderSz The order size scaled to perp szDecimals.
+    function _parsePerpBridgeAction(CoreWriterSim.QueuedAction memory action)
+        private
+        view
+        returns (PerpBridgeApplyRequest memory request, uint64 rawOrderSz, uint64 scaledOrderSz)
+    {
+        require(action.kind == HLConstants.LIMIT_ORDER_ACTION, "invalid action kind");
+
+        (bool decoded, uint32 perpAsset, bool isBuy,, uint64 sz, bool reduceOnly, uint8 tif, uint128 cloid) =
+            _decodePerpLimitOrderPayload(action.payload);
+        require(decoded, "invalid perp order payload");
+
+        // Scale sz from CoreWriter 8-dec to perp szDecimals
+        (bool hasSzDec, uint8 szDecimals) = _tryGetPerpSzDecimals(perpAsset);
+        require(hasSzDec, "perp asset info missing");
+
+        scaledOrderSz = _scale(sz, 8, szDecimals);
+
+        request = PerpBridgeApplyRequest({
+            actionId: action.actionId,
+            sender: action.sender,
+            perpAsset: perpAsset,
+            isBuy: isBuy,
+            limitPx: 0,
+            sz: sz,
+            reduceOnly: reduceOnly,
+            tif: tif,
+            cloid: cloid,
+            l1Block: action.l1Block
+        });
+
+        rawOrderSz = sz;
+    }
+
+    /// @notice Passthrough to call applyPerpBridgeActionResult on HyperCore directly.
+    function applyPerpBridgeActionResult(
+        uint64 actionId,
+        address sender,
+        uint32 perpAsset,
+        bool isBuy,
+        uint64 filledSz,
+        uint64 executionPrice,
+        uint128 cloid,
+        uint8 status,
+        uint8 reason,
+        uint64 l1Block
+    ) internal {
+        hyperCore.applyPerpBridgeActionResult(
+            actionId, sender, perpAsset, isBuy, filledSz, executionPrice, cloid, status, reason, l1Block
         );
     }
 
