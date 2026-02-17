@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: virtual-hypercore
+  labels:
+    app: virtual-hypercore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: virtual-hypercore
+  template:
+    metadata:
+      labels:
+        app: virtual-hypercore
+    spec:
+      containers:
+        - name: virtual-hypercore
+          image: virtual-hypercore:latest
+          ports:
+            - containerPort: 3010
+          env:
+            - name: PORT
+              value: "3010"
+            - name: NODE_ENV
+              value: "production"
+            - name: ANVIL_RPC_URL
+              value: "http://anvil:8545"
+            - name: SYMBOLS
+              value: "ETH-USD,BTC-USD,SOL-USD"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3010
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3010
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: virtual-hypercore
+  labels:
+    app: virtual-hypercore
+spec:
+  selector:
+    app: virtual-hypercore
+  ports:
+    - protocol: TCP
+      port: 3010
+      targetPort: 3010
