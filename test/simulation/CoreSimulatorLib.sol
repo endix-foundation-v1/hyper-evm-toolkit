@@ -30,13 +30,6 @@ library CoreSimulatorLib {
 
     HyperCore constant hyperCore = HyperCore(payable(0x9999999999999999999999999999999999999999));
 
-    struct SpotLimitExecutionData {
-        uint64 baseToken;
-        uint64 quoteToken;
-        uint64 filledAmount;
-        uint64 executionPrice;
-    }
-
     struct SpotTokenInfo {
         uint64 baseToken;
         uint64 quoteToken;
@@ -57,8 +50,33 @@ library CoreSimulatorLib {
         uint64 l1Block;
     }
 
+    struct DeferredSpotOrder {
+        uint64 actionId;
+        address sender;
+        uint32 spotMarketId;
+        bool isBuy;
+        uint64 limitPx;
+        uint64 sz;
+        uint128 cloid;
+        uint64 l1Block;
+    }
+
     // ERC20 Transfer event signature
     bytes32 constant TRANSFER_EVENT_SIG = keccak256("Transfer(address,address,uint256)");
+
+    // Storage slot for deferred orders (libraries cannot have state variables)
+    bytes32 private constant DEFERRED_ORDERS_SLOT = keccak256("CoreSimulatorLib.deferredSpotOrders");
+
+    struct DeferredOrdersStorage {
+        DeferredSpotOrder[] orders;
+    }
+
+    function _getDeferredOrdersStorage() private pure returns (DeferredOrdersStorage storage s) {
+        bytes32 slot = DEFERRED_ORDERS_SLOT;
+        assembly {
+            s.slot := slot
+        }
+    }
 
     function init() internal returns (HyperCore) {
         vm.pauseGasMetering();
@@ -110,9 +128,10 @@ library CoreSimulatorLib {
      *   1. ERC20 transfers to system addresses (EVM->Core)
      *   2. Block number + timestamp advance
      *   3. Liquidate positions
-     *   4. Process callback queue (token/native transfers via priority queue)
-     *   5. Process ring buffer with ADR-018 auto-apply (spot→bridge, sends→spotSend, rest→rawAction)
-     *   6. Process pending orders
+     *   4. Check deferred spot limit orders against updated prices
+     *   5. Process callback queue (token/native transfers via priority queue)
+     *   6. Process ring buffer with ADR-018 auto-apply (spot→bridge/defer, sends→spotSend, rest→rawAction)
+     *   7. Process pending orders
      * @param expectRevert If true, do not revert on action failures and instead return
      *        whether any queued action failed.
      */
@@ -150,6 +169,9 @@ library CoreSimulatorLib {
         // liquidate any positions that are liquidatable
         hyperCore.liquidatePositions();
 
+        // Check deferred orders from previous blocks against updated prices
+        _checkDeferredOrders();
+
         // Process callback queue first for bridge-credit-dependent flows
         coreWriter.executeQueuedActions(false);
 
@@ -167,8 +189,7 @@ library CoreSimulatorLib {
      * @notice Drains queued ring-buffer actions and auto-applies them via ADR-018 routing.
      * @dev Spot limit orders route through `applyBridgeActionResult(FILLED)` with market
      *      execution price. Spot sends route through `applySpotSendAction()`. Everything else
-     *      (perps, vaults, staking, delegation, non-executable spot orders) falls back to
-     *      `executeRawAction()`.
+     *      (perps, vaults, staking, delegation) falls back to `executeRawAction()`.
      * @param expectRevert If true, treat execution failures as soft failures instead of revert.
      * @return anyFail True when any queued action execution fails.
      */
@@ -228,30 +249,89 @@ library CoreSimulatorLib {
             return (false, false);
         }
 
-        (bool canApplyBridge, SpotLimitExecutionData memory executionData) =
-            _prepareSpotLimitBridgeExecution(spotMarketId, isBuy, limitPx, sz);
-        if (!canApplyBridge) {
-            return (false, false);
-        }
-
-        BridgeApplyRequest memory request = BridgeApplyRequest({
+        DeferredSpotOrder memory order = DeferredSpotOrder({
             actionId: action.actionId,
             sender: action.sender,
             spotMarketId: spotMarketId,
             isBuy: isBuy,
-            baseToken: executionData.baseToken,
-            quoteToken: executionData.quoteToken,
-            filledAmount: executionData.filledAmount,
-            executionPrice: executionData.executionPrice,
+            limitPx: limitPx,
+            sz: sz,
             cloid: cloid,
             l1Block: action.l1Block
         });
 
+        (bool canExecuteNow, bool routeSuccess) = _tryExecuteDeferredSpotOrder(order);
+        if (!canExecuteNow) {
+            _deferOrder(order);
+            return (true, true);
+        }
+
+        return (true, routeSuccess);
+    }
+
+    function _deferOrder(DeferredSpotOrder memory order) private {
+        DeferredOrdersStorage storage dos = _getDeferredOrdersStorage();
+        dos.orders.push(order);
+    }
+
+    function _tryExecuteDeferredSpotOrder(DeferredSpotOrder memory order)
+        private
+        returns (bool canExecuteNow, bool success)
+    {
+        (bool lookupSuccess, SpotTokenInfo memory spotTokenInfo) = _tryReadSpotAndBaseTokenInfo(order.spotMarketId);
+        if (!lookupSuccess) {
+            return (false, true);
+        }
+
+        (bool hasSpotPx, uint64 spotPx) = _tryGetSpotPxForBridge(order.spotMarketId, spotTokenInfo.baseSzDecimals);
+        if (!hasSpotPx) {
+            return (false, true);
+        }
+
+        bool executable = order.isBuy ? order.limitPx >= spotPx : order.limitPx <= spotPx;
+        if (!executable) {
+            return (false, true);
+        }
+
+        (bool hasAmounts, uint64 filledAmount, uint64 executionPrice) =
+            _tryPrepareBridgeAmounts(order.isBuy, order.sz, spotPx, spotTokenInfo.baseWeiDecimals);
+        if (!hasAmounts) {
+            return (false, true);
+        }
+
+        BridgeApplyRequest memory request = BridgeApplyRequest({
+            actionId: order.actionId,
+            sender: order.sender,
+            spotMarketId: order.spotMarketId,
+            isBuy: order.isBuy,
+            baseToken: spotTokenInfo.baseToken,
+            quoteToken: spotTokenInfo.quoteToken,
+            filledAmount: filledAmount,
+            executionPrice: executionPrice,
+            cloid: order.cloid,
+            l1Block: order.l1Block
+        });
+
         success = _applyBridgeActionResultLowLevel(request);
         // ADR-018 Rev 3: No spotPx correction needed — executionPrice is real market price.
-        // FIXME(phase2): handle weiDecimals≠8 spotPrice correction if needed.
-
+        // FIXME(phase2): handle weiDecimals!=8 spotPrice correction if needed.
         return (true, success);
+    }
+
+    function _checkDeferredOrders() internal {
+        DeferredOrdersStorage storage dos = _getDeferredOrdersStorage();
+        uint256 i = 0;
+        while (i < dos.orders.length) {
+            DeferredSpotOrder memory order = dos.orders[i];
+
+            (bool canExecuteNow, bool success) = _tryExecuteDeferredSpotOrder(order);
+            if (canExecuteNow && success) {
+                dos.orders[i] = dos.orders[dos.orders.length - 1];
+                dos.orders.pop();
+            } else {
+                i++;
+            }
+        }
     }
 
     function _decodeSpotLimitOrderPayload(bytes memory payload)
@@ -275,38 +355,6 @@ library CoreSimulatorLib {
         return (true, spotMarketId, isBuy, limitPx, sz, cloid);
     }
 
-    function _prepareSpotLimitBridgeExecution(uint32 spotMarketId, bool isBuy, uint64 limitPx, uint64 sz)
-        private
-        returns (bool canApplyBridge, SpotLimitExecutionData memory executionData)
-    {
-        (bool lookupSuccess, SpotTokenInfo memory spotTokenInfo) = _tryReadSpotAndBaseTokenInfo(spotMarketId);
-        if (!lookupSuccess) {
-            return (false, executionData);
-        }
-
-        (bool hasSpotPx, uint64 spotPx) = _tryGetSpotPxForBridge(spotMarketId, spotTokenInfo.baseSzDecimals);
-        if (!hasSpotPx) {
-            return (false, executionData);
-        }
-
-        bool executable = isBuy ? limitPx >= spotPx : limitPx <= spotPx;
-        if (!executable) {
-            return (false, executionData);
-        }
-
-        (bool hasAmounts, uint64 filledAmount, uint64 executionPrice) =
-            _tryPrepareBridgeAmounts(isBuy, sz, spotPx, spotTokenInfo.baseWeiDecimals);
-        if (!hasAmounts) {
-            return (false, executionData);
-        }
-
-        executionData.baseToken = spotTokenInfo.baseToken;
-        executionData.quoteToken = spotTokenInfo.quoteToken;
-        executionData.filledAmount = filledAmount;
-        executionData.executionPrice = executionPrice;
-        return (true, executionData);
-    }
-
     function _tryGetSpotPxForBridge(uint32 spotMarketId, uint8 baseSzDecimals)
         private
         returns (bool hasSpotPx, uint64 spotPx)
@@ -315,7 +363,7 @@ library CoreSimulatorLib {
         spotPx = originalPx * SafeCast.toUint64(10 ** baseSzDecimals);
 
         if (spotPx == 0 && !hyperCore.useRealL1Read()) {
-            // Preserve executeSpotLimitOrder's offline-mode revert path via executeRawAction fallback.
+            // In offline mode keep order deferred until a usable spot price is available.
             return (false, 0);
         }
 
@@ -461,6 +509,11 @@ library CoreSimulatorLib {
 
     function getQueuedActionCount() internal view returns (uint256) {
         return coreWriter.getQueueLength();
+    }
+
+    function getDeferredOrderCount() internal view returns (uint256) {
+        DeferredOrdersStorage storage dos = _getDeferredOrdersStorage();
+        return dos.orders.length;
     }
 
     function getQueuedActions(uint256 offset, uint256 limit)
