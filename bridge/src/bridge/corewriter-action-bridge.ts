@@ -142,6 +142,24 @@ const hyperCoreAbi = [
   },
   {
     type: 'function',
+    name: 'applyPerpBridgeActionResult',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'actionId', type: 'uint64' },
+      { name: 'sender', type: 'address' },
+      { name: 'perpAsset', type: 'uint32' },
+      { name: 'isBuy', type: 'bool' },
+      { name: 'filledSz', type: 'uint64' },
+      { name: 'executionPrice', type: 'uint64' },
+      { name: 'cloid', type: 'uint128' },
+      { name: 'status', type: 'uint8' },
+      { name: 'reason', type: 'uint8' },
+      { name: 'l1Block', type: 'uint64' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
     name: 'markBridgeActionProcessed',
     stateMutability: 'nonpayable',
     inputs: [
@@ -342,6 +360,10 @@ export class CoreWriterActionBridge {
     return this.markProcessed(action, STATUS.UNSUPPORTED, REASON.UNSUPPORTED_KIND, 0n);
   }
 
+  private isSpotAsset(asset: number): boolean {
+    return asset >= SPOT_ASSET_OFFSET && asset < 100_000;
+  }
+
   private async processLimitOrderAction(action: QueuedAction): Promise<boolean> {
     let decodedClOid = 0n;
     let asset = 0;
@@ -381,8 +403,8 @@ export class CoreWriterActionBridge {
     try {
       const cloidRaw = decodedClOid;
 
-      if (asset < SPOT_ASSET_OFFSET || asset >= 100_000) {
-        return this.markProcessed(action, STATUS.REJECTED, REASON.INVALID_ACTION, cloidRaw);
+      if (!this.isSpotAsset(asset)) {
+        return this.processPerpLimitOrderAction(action, asset, isBuy, limitPxRaw, sizeRaw, tifRaw, decodedClOid);
       }
 
       const spotIndex = asset - SPOT_ASSET_OFFSET;
@@ -391,7 +413,7 @@ export class CoreWriterActionBridge {
         return this.markProcessed(action, STATUS.REJECTED, REASON.SYMBOL_NOT_MAPPED, cloidRaw);
       }
 
-      const tif = this.mapTimeInForce(Number(tifRaw));
+      const tif = this.mapTimeInForce(tifRaw);
       if (!tif) {
         return this.markProcessed(action, STATUS.REJECTED, REASON.UNSUPPORTED_TIF, cloidRaw);
       }
@@ -477,6 +499,82 @@ export class CoreWriterActionBridge {
     }
   }
 
+  private async processPerpLimitOrderAction(
+    action: QueuedAction,
+    perpAsset: number,
+    isBuy: boolean,
+    limitPxRaw: bigint,
+    sizeRaw: bigint,
+    tifRaw: number,
+    cloidRaw: bigint
+  ): Promise<boolean> {
+    const perpMarketMap = this.config.perpMarketMap ?? {};
+    const symbol = perpMarketMap[String(perpAsset)];
+    if (!symbol) {
+      return this.markProcessed(action, STATUS.REJECTED, REASON.SYMBOL_NOT_MAPPED, cloidRaw);
+    }
+
+    const tif = this.mapTimeInForce(tifRaw);
+    if (!tif) {
+      return this.markProcessed(action, STATUS.REJECTED, REASON.UNSUPPORTED_TIF, cloidRaw);
+    }
+
+    const quantity = this.toSafeInteger(sizeRaw);
+    const price = this.toSafeInteger(limitPxRaw);
+
+    if (quantity === null || price === null || quantity <= 0 || price <= 0) {
+      return this.markProcessed(action, STATUS.REJECTED, REASON.INVALID_ACTION, cloidRaw);
+    }
+
+    const orderId = cloidRaw.toString();
+    const submitResult = await this.engine.submitOrder({
+      id: orderId,
+      symbol,
+      userId: action.sender.toLowerCase(),
+      side: isBuy ? 'buy' : 'sell',
+      kind: 'limit',
+      quantity,
+      price,
+      timeInForce: tif,
+    });
+
+    const fills = submitResult.trades.filter(
+      (trade) => trade.takerOrderId === orderId || trade.makerOrderId === orderId
+    );
+
+    const filledQuantity = fills.reduce((sum, trade) => sum + trade.quantity, 0);
+    const weightedNotional = fills.reduce((sum, trade) => sum + trade.quantity * trade.price, 0);
+    const executionPrice = filledQuantity > 0 ? Math.round(weightedNotional / filledQuantity) : 0;
+
+    const outcome = this.mapLimitOrderOutcome(submitResult.order.status, this.extractOrderReason(submitResult), filledQuantity);
+    const status = outcome.status;
+    const reason = outcome.reason;
+
+    if (filledQuantity === 0 || executionPrice === 0) {
+      return this.markProcessed(action, status, reason, cloidRaw);
+    }
+
+    return this.sendTransaction(
+      this.config.hyperCoreAddress,
+      encodeFunctionData({
+        abi: hyperCoreAbi,
+        functionName: 'applyPerpBridgeActionResult',
+        args: [
+          action.actionId,
+          action.sender,
+          perpAsset,
+          isBuy,
+          BigInt(Math.round(filledQuantity)),
+          BigInt(executionPrice),
+          cloidRaw,
+          status,
+          reason,
+          action.l1Block,
+        ],
+      })
+    );
+  }
+
   private async processCancelByOidAction(action: QueuedAction): Promise<boolean> {
     let orderIdRaw = 0n;
     let asset = 0;
@@ -498,12 +596,7 @@ export class CoreWriterActionBridge {
     }
 
     try {
-      if (asset < SPOT_ASSET_OFFSET || asset >= 100_000) {
-        return this.markProcessed(action, STATUS.REJECTED, REASON.INVALID_ACTION, 0n);
-      }
-
-      const spotIndex = asset - SPOT_ASSET_OFFSET;
-      const symbol = this.config.marketMap[String(spotIndex)];
+      const symbol = this.resolveSymbolForAsset(asset);
       if (!symbol) {
         return this.markProcessed(action, STATUS.REJECTED, REASON.SYMBOL_NOT_MAPPED, 0n);
       }
@@ -544,12 +637,7 @@ export class CoreWriterActionBridge {
     }
 
     try {
-      if (asset < SPOT_ASSET_OFFSET || asset >= 100_000) {
-        return this.markProcessed(action, STATUS.REJECTED, REASON.INVALID_ACTION, cloidRaw);
-      }
-
-      const spotIndex = asset - SPOT_ASSET_OFFSET;
-      const symbol = this.config.marketMap[String(spotIndex)];
+      const symbol = this.resolveSymbolForAsset(asset);
       if (!symbol) {
         return this.markProcessed(action, STATUS.REJECTED, REASON.SYMBOL_NOT_MAPPED, cloidRaw);
       }
@@ -571,6 +659,15 @@ export class CoreWriterActionBridge {
       });
       return this.markProcessed(action, STATUS.ERROR, REASON.ENGINE_ERROR, cloidRaw);
     }
+  }
+
+  private resolveSymbolForAsset(asset: number): string | undefined {
+    if (this.isSpotAsset(asset)) {
+      const spotIndex = asset - SPOT_ASSET_OFFSET;
+      return this.config.marketMap[String(spotIndex)];
+    }
+    const perpMarketMap = this.config.perpMarketMap ?? {};
+    return perpMarketMap[String(asset)];
   }
 
   private async processSpotSendAction(action: QueuedAction): Promise<boolean> {

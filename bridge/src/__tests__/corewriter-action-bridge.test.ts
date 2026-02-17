@@ -49,10 +49,32 @@ const HYPER_CORE_WRITE_ABI = [
   },
 ] as const;
 
-function createEngine(): MatchingEngine {
+const HYPER_CORE_PERP_ABI = [
+  ...HYPER_CORE_WRITE_ABI,
+  {
+    type: 'function',
+    name: 'applyPerpBridgeActionResult',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'actionId', type: 'uint64' },
+      { name: 'sender', type: 'address' },
+      { name: 'perpAsset', type: 'uint32' },
+      { name: 'isBuy', type: 'bool' },
+      { name: 'filledSz', type: 'uint64' },
+      { name: 'executionPrice', type: 'uint64' },
+      { name: 'cloid', type: 'uint128' },
+      { name: 'status', type: 'uint8' },
+      { name: 'reason', type: 'uint8' },
+      { name: 'l1Block', type: 'uint64' },
+    ],
+    outputs: [],
+  },
+] as const;
+
+function createEngine(symbols = ['ETH-USD']): MatchingEngine {
   return new MatchingEngine({
     config: {
-      symbols: ['ETH-USD'],
+      symbols,
       tickSize: 1,
       lotSize: 1,
       minOrderQuantity: 1,
@@ -465,5 +487,387 @@ describe('CoreWriterActionBridge', () => {
       (call) => (call[0] as { to: string }).to === CORE_WRITER_ADDRESS
     );
     expect(consumeCalls.length).toBe(0);
+  });
+
+  it('settles filled perp limit orders via applyPerpBridgeActionResult', async () => {
+    await rm(TEST_LOG_PATH, { force: true });
+
+    const makerPayload = encodeAbiParameters(
+      [
+        { type: 'uint32' },
+        { type: 'bool' },
+        { type: 'uint64' },
+        { type: 'uint64' },
+        { type: 'bool' },
+        { type: 'uint8' },
+        { type: 'uint128' },
+      ],
+      [150, false, 100n, 5n, false, 2, 1001n]
+    );
+
+    const takerPayload = encodeAbiParameters(
+      [
+        { type: 'uint32' },
+        { type: 'bool' },
+        { type: 'uint64' },
+        { type: 'uint64' },
+        { type: 'bool' },
+        { type: 'uint8' },
+        { type: 'uint128' },
+      ],
+      [150, true, 100n, 2n, false, 3, 1002n]
+    );
+
+    let queueLength = 2n;
+    let queuedActions: unknown[] = [
+      {
+        actionId: 1n,
+        sender: '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
+        kind: 1,
+        payload: makerPayload,
+        l1Block: 120n,
+      },
+      {
+        actionId: 2n,
+        sender: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
+        kind: 1,
+        payload: takerPayload,
+        l1Block: 120n,
+      },
+    ];
+
+    const readContract = vi.fn(async (request: { functionName: string; args?: readonly unknown[] }) => {
+      if (request.functionName === 'getQueueLength') {
+        return queueLength;
+      }
+      if (request.functionName === 'getQueuedActions') {
+        return queuedActions;
+      }
+      if (request.functionName === 'processedActions') {
+        return false;
+      }
+
+      throw new Error(`unexpected readContract function: ${request.functionName}`);
+    });
+
+    const sendTransaction = vi.fn(async (request: { to: `0x${string}`; data: `0x${string}` }) => {
+      if (request.to === CORE_WRITER_ADDRESS) {
+        queueLength = 0n;
+        queuedActions = [];
+      }
+
+      const txHash: `0x${string}` =
+        '0x4444444444444444444444444444444444444444444444444444444444444444';
+      return txHash;
+    });
+
+    const bridge = createBridgeStub(readContract, sendTransaction);
+    const adapter = new CoreWriterActionBridge(bridge, createEngine(['ETH-USD', 'HYPE-PERP']), {
+      enabled: true,
+      mode: 'manual',
+      intervalMs: 100,
+      coreWriterAddress: CORE_WRITER_ADDRESS,
+      hyperCoreAddress: HYPER_CORE_ADDRESS,
+      marketMap: {
+        '1': 'ETH-USD',
+      },
+      perpMarketMap: {
+        '150': 'HYPE-PERP',
+      },
+    });
+
+    const result = await adapter.syncOnce();
+    expect(result.processed).toBe(2);
+    expect(result.applied).toBe(2);
+    expect(result.failed).toBe(0);
+
+    const callsToHyperCore = sendTransaction.mock.calls.filter(
+      (call) => (call[0] as { to: string }).to === HYPER_CORE_ADDRESS
+    );
+    expect(callsToHyperCore.length).toBeGreaterThanOrEqual(2);
+
+    const hasPerpSettlement = callsToHyperCore.some((call) => {
+      const decoded = decodeFunctionData({
+        abi: HYPER_CORE_PERP_ABI,
+        data: (call[0] as { data: `0x${string}` }).data,
+      });
+      return decoded.functionName === 'applyPerpBridgeActionResult';
+    });
+
+    expect(hasPerpSettlement).toBe(true);
+  });
+
+  it('rejects perp orders with unmapped symbols as SYMBOL_NOT_MAPPED', async () => {
+    await rm(TEST_LOG_PATH, { force: true });
+
+    const payload = encodeAbiParameters(
+      [
+        { type: 'uint32' },
+        { type: 'bool' },
+        { type: 'uint64' },
+        { type: 'uint64' },
+        { type: 'bool' },
+        { type: 'uint8' },
+        { type: 'uint128' },
+      ],
+      [999, true, 100n, 1n, false, 2, 9001n]
+    );
+
+    let queueLength = 1n;
+    let queuedActions: unknown[] = [
+      {
+        actionId: 1n,
+        sender: '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
+        kind: 1,
+        payload,
+        l1Block: 130n,
+      },
+    ];
+
+    const readContract = vi.fn(async (request: { functionName: string; args?: readonly unknown[] }) => {
+      if (request.functionName === 'getQueueLength') {
+        return queueLength;
+      }
+      if (request.functionName === 'getQueuedActions') {
+        return queuedActions;
+      }
+      if (request.functionName === 'processedActions') {
+        return false;
+      }
+
+      throw new Error(`unexpected readContract function: ${request.functionName}`);
+    });
+
+    const sendTransaction = vi.fn(async (request: { to: `0x${string}`; data: `0x${string}` }) => {
+      if (request.to === CORE_WRITER_ADDRESS) {
+        queueLength = 0n;
+        queuedActions = [];
+      }
+
+      const txHash: `0x${string}` =
+        '0x5555555555555555555555555555555555555555555555555555555555555555';
+      return txHash;
+    });
+
+    const bridge = createBridgeStub(readContract, sendTransaction);
+    const adapter = new CoreWriterActionBridge(bridge, createEngine(['ETH-USD', 'HYPE-PERP']), {
+      enabled: true,
+      mode: 'manual',
+      intervalMs: 100,
+      coreWriterAddress: CORE_WRITER_ADDRESS,
+      hyperCoreAddress: HYPER_CORE_ADDRESS,
+      marketMap: {
+        '1': 'ETH-USD',
+      },
+      perpMarketMap: {
+        '150': 'HYPE-PERP',
+      },
+    });
+
+    const result = await adapter.syncOnce();
+    expect(result.processed).toBe(1);
+    expect(result.applied).toBe(1);
+    expect(result.failed).toBe(0);
+
+    const hyperCoreCall = sendTransaction.mock.calls.find(
+      (call) => (call[0] as { to: string }).to === HYPER_CORE_ADDRESS
+    );
+    expect(hyperCoreCall).toBeDefined();
+
+    const decoded = decodeFunctionData({
+      abi: HYPER_CORE_WRITE_ABI,
+      data: (hyperCoreCall?.[0] as { data: `0x${string}` }).data,
+    });
+
+    expect(decoded.functionName).toBe('markBridgeActionProcessed');
+    const args = decoded.args as readonly [bigint, number, number, bigint, bigint];
+    expect(args[1]).toBe(5);
+    expect(args[2]).toBe(3);
+  });
+
+  it('cancels perp orders by cloid', async () => {
+    await rm(TEST_LOG_PATH, { force: true });
+
+    const openOrderPayload = encodeAbiParameters(
+      [
+        { type: 'uint32' },
+        { type: 'bool' },
+        { type: 'uint64' },
+        { type: 'uint64' },
+        { type: 'bool' },
+        { type: 'uint8' },
+        { type: 'uint128' },
+      ],
+      [150, false, 100n, 5n, false, 2, 777n]
+    );
+    const cancelPayload = encodeAbiParameters([{ type: 'uint32' }, { type: 'uint128' }], [150, 777n]);
+
+    let queueLength = 2n;
+    let queuedActions: unknown[] = [
+      {
+        actionId: 11n,
+        sender: '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
+        kind: 1,
+        payload: openOrderPayload,
+        l1Block: 140n,
+      },
+      {
+        actionId: 12n,
+        sender: '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
+        kind: 11,
+        payload: cancelPayload,
+        l1Block: 140n,
+      },
+    ];
+
+    const readContract = vi.fn(async (request: { functionName: string; args?: readonly unknown[] }) => {
+      if (request.functionName === 'getQueueLength') {
+        return queueLength;
+      }
+      if (request.functionName === 'getQueuedActions') {
+        return queuedActions;
+      }
+      if (request.functionName === 'processedActions') {
+        return false;
+      }
+
+      throw new Error(`unexpected readContract function: ${request.functionName}`);
+    });
+
+    const sendTransaction = vi.fn(async (request: { to: `0x${string}`; data: `0x${string}` }) => {
+      if (request.to === CORE_WRITER_ADDRESS) {
+        queueLength = 0n;
+        queuedActions = [];
+      }
+
+      const txHash: `0x${string}` =
+        '0x6666666666666666666666666666666666666666666666666666666666666666';
+      return txHash;
+    });
+
+    const bridge = createBridgeStub(readContract, sendTransaction);
+    const adapter = new CoreWriterActionBridge(bridge, createEngine(['ETH-USD', 'HYPE-PERP']), {
+      enabled: true,
+      mode: 'manual',
+      intervalMs: 100,
+      coreWriterAddress: CORE_WRITER_ADDRESS,
+      hyperCoreAddress: HYPER_CORE_ADDRESS,
+      marketMap: {
+        '1': 'ETH-USD',
+      },
+      perpMarketMap: {
+        '150': 'HYPE-PERP',
+      },
+    });
+
+    const result = await adapter.syncOnce();
+    expect(result.processed).toBe(2);
+    expect(result.applied).toBe(2);
+    expect(result.failed).toBe(0);
+
+    const decodedMarkCalls = sendTransaction.mock.calls
+      .filter((call) => (call[0] as { to: string }).to === HYPER_CORE_ADDRESS)
+      .map((call) =>
+        decodeFunctionData({
+          abi: HYPER_CORE_WRITE_ABI,
+          data: (call[0] as { data: `0x${string}` }).data,
+        })
+      )
+      .filter((decoded) => decoded.functionName === 'markBridgeActionProcessed');
+
+    const cancelCall = decodedMarkCalls.find((decoded) => {
+      const args = decoded.args as readonly [bigint, number, number, bigint, bigint];
+      return args[0] === 12n;
+    });
+
+    expect(cancelCall).toBeDefined();
+    const cancelArgs = (cancelCall?.args ?? []) as readonly [bigint, number, number, bigint, bigint];
+    expect(cancelArgs[1]).toBe(4);
+    expect(cancelArgs[2]).toBe(0);
+  });
+
+  it('rejects perp orders as SYMBOL_NOT_MAPPED when perpMarketMap is omitted', async () => {
+    await rm(TEST_LOG_PATH, { force: true });
+
+    const payload = encodeAbiParameters(
+      [
+        { type: 'uint32' },
+        { type: 'bool' },
+        { type: 'uint64' },
+        { type: 'uint64' },
+        { type: 'bool' },
+        { type: 'uint8' },
+        { type: 'uint128' },
+      ],
+      [150, false, 100n, 1n, false, 2, 12345n]
+    );
+
+    let queueLength = 1n;
+    let queuedActions: unknown[] = [
+      {
+        actionId: 20n,
+        sender: '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
+        kind: 1,
+        payload,
+        l1Block: 150n,
+      },
+    ];
+
+    const readContract = vi.fn(async (request: { functionName: string; args?: readonly unknown[] }) => {
+      if (request.functionName === 'getQueueLength') {
+        return queueLength;
+      }
+      if (request.functionName === 'getQueuedActions') {
+        return queuedActions;
+      }
+      if (request.functionName === 'processedActions') {
+        return false;
+      }
+
+      throw new Error(`unexpected readContract function: ${request.functionName}`);
+    });
+
+    const sendTransaction = vi.fn(async (request: { to: `0x${string}`; data: `0x${string}` }) => {
+      if (request.to === CORE_WRITER_ADDRESS) {
+        queueLength = 0n;
+        queuedActions = [];
+      }
+
+      const txHash: `0x${string}` =
+        '0x7777777777777777777777777777777777777777777777777777777777777777';
+      return txHash;
+    });
+
+    const bridge = createBridgeStub(readContract, sendTransaction);
+    const adapter = new CoreWriterActionBridge(bridge, createEngine(['ETH-USD', 'HYPE-PERP']), {
+      enabled: true,
+      mode: 'manual',
+      intervalMs: 100,
+      coreWriterAddress: CORE_WRITER_ADDRESS,
+      hyperCoreAddress: HYPER_CORE_ADDRESS,
+      marketMap: {
+        '1': 'ETH-USD',
+      },
+    });
+
+    const result = await adapter.syncOnce();
+    expect(result.processed).toBe(1);
+    expect(result.applied).toBe(1);
+    expect(result.failed).toBe(0);
+
+    const hyperCoreCall = sendTransaction.mock.calls.find(
+      (call) => (call[0] as { to: string }).to === HYPER_CORE_ADDRESS
+    );
+    expect(hyperCoreCall).toBeDefined();
+
+    const decoded = decodeFunctionData({
+      abi: HYPER_CORE_WRITE_ABI,
+      data: (hyperCoreCall?.[0] as { data: `0x${string}` }).data,
+    });
+
+    expect(decoded.functionName).toBe('markBridgeActionProcessed');
+    const args = decoded.args as readonly [bigint, number, number, bigint, bigint];
+    expect(args[1]).toBe(5);
+    expect(args[2]).toBe(3);
   });
 });

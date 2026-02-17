@@ -31,6 +31,7 @@ export interface CoreWriterActionBridgeConfig {
   coreWriterAddress: `0x${string}`;
   hyperCoreAddress: `0x${string}`;
   marketMap: Record<string, string>;
+  perpMarketMap?: Record<string, string>;
 }
 
 export interface ReplayConfig {
