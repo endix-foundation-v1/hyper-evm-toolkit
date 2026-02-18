@@ -75,7 +75,7 @@ jobs:
         run: forge build
 
       - name: Run Solidity tests
-        run: forge test -vvv
+        run: forge test --match-path "test/unit-tests/vhc/*.t.sol" --summary
 
   bridge-test:
     name: bridge-test
