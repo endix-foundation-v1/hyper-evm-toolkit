@@ -12,6 +12,10 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 interface ICoreDepositWalletSim {
     error InsufficientAmountForActivation();
+    error SystemAddressRecipient();
+    error SelfAddressRecipient();
+
+    function deposit(uint256 amount, uint32 destinationDex) external;
 
     function depositFor(address recipient, uint256 amount, uint32 destinationDex) external;
 }
@@ -97,7 +101,9 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
 
         uint64 quoteAmount = uint64(200e8);
         uint64 feeAmount = (hyperCore.spotMakerFee() > 0)
-            ? SafeCast.toUint64((uint256(quoteAmount) * uint256(hyperCore.spotMakerFee())) / hyperCore.FEE_DENOMINATOR())
+            ? SafeCast.toUint64(
+                (uint256(quoteAmount) * uint256(hyperCore.spotMakerFee())) / hyperCore.FEE_DENOMINATOR()
+            )
             : 0;
 
         assertEq(PrecompileLib.spotBalance(alice, BASE_TOKEN).total, baseBefore + 2e8);
@@ -224,8 +230,7 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
     function test_markBridgeActionProcessed_revertsOnNonTerminalStatus() public {
         vm.expectRevert(
             abi.encodeWithSelector(
-                HyperCore.InvalidBridgeActionStatus.selector,
-                uint8(HyperCore.BridgeActionStatus.OPEN)
+                HyperCore.InvalidBridgeActionStatus.selector, uint8(HyperCore.BridgeActionStatus.OPEN)
             )
         );
 
@@ -290,15 +295,60 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
     function test_coreDepositWallet_depositForCreditsAndActivatesRecipient() public {
         address recipient = makeAddr("recipient");
         assertFalse(PrecompileLib.coreUserExists(recipient));
+        assertEq(_perpBalance(recipient), 0);
 
         vm.prank(alice);
-        _coreDepositWallet().depositFor(recipient, 10e6, type(uint32).max);
+        _coreDepositWallet().depositFor(recipient, 10e6, HLConstants.SPOT_DEX);
         assertEq(PrecompileLib.spotBalance(recipient, QUOTE_TOKEN).total, 9e8);
+        assertEq(_perpBalance(recipient), 0);
         assertTrue(PrecompileLib.coreUserExists(recipient));
 
         vm.prank(alice);
-        _coreDepositWallet().depositFor(recipient, 10e6, type(uint32).max);
+        _coreDepositWallet().depositFor(recipient, 10e6, HLConstants.SPOT_DEX);
         assertEq(PrecompileLib.spotBalance(recipient, QUOTE_TOKEN).total, 19e8);
+        assertEq(_perpBalance(recipient), 0);
+    }
+
+    function test_coreDepositWallet_depositPerpDexCreditsCallerPerpBalance() public {
+        uint64 spotBefore = PrecompileLib.spotBalance(alice, QUOTE_TOKEN).total;
+        uint64 perpBefore = _perpBalance(alice);
+
+        vm.prank(alice);
+        _coreDepositWallet().deposit(10e6, HLConstants.DEFAULT_PERP_DEX);
+
+        assertEq(PrecompileLib.spotBalance(alice, QUOTE_TOKEN).total, spotBefore);
+        assertEq(_perpBalance(alice), perpBefore + 10e8);
+    }
+
+    function test_coreDepositWallet_depositForPerpDexCreditsRecipientPerpBalance() public {
+        address recipient = makeAddr("recipient-perp");
+        assertFalse(PrecompileLib.coreUserExists(recipient));
+        assertEq(_perpBalance(recipient), 0);
+
+        vm.prank(alice);
+        _coreDepositWallet().depositFor(recipient, 10e6, HLConstants.DEFAULT_PERP_DEX);
+        assertEq(_perpBalance(recipient), 9e8);
+        assertEq(PrecompileLib.spotBalance(recipient, QUOTE_TOKEN).total, 0);
+        assertTrue(PrecompileLib.coreUserExists(recipient));
+
+        vm.prank(alice);
+        _coreDepositWallet().depositFor(recipient, 10e6, HLConstants.DEFAULT_PERP_DEX);
+        assertEq(_perpBalance(recipient), 19e8);
+        assertEq(PrecompileLib.spotBalance(recipient, QUOTE_TOKEN).total, 0);
+    }
+
+    function test_coreDepositWallet_revertsWhenRecipientIsSystemAddress() public {
+        address systemRecipient = address(uint160(HLConstants.BASE_SYSTEM_ADDRESS));
+
+        vm.prank(alice);
+        vm.expectRevert(ICoreDepositWalletSim.SystemAddressRecipient.selector);
+        _coreDepositWallet().depositFor(systemRecipient, 10e6, HLConstants.SPOT_DEX);
+    }
+
+    function test_coreDepositWallet_revertsWhenRecipientIsCoreDepositWalletAddress() public {
+        vm.prank(alice);
+        vm.expectRevert(ICoreDepositWalletSim.SelfAddressRecipient.selector);
+        _coreDepositWallet().depositFor(HLConstants.coreDepositWallet(), 10e6, HLConstants.SPOT_DEX);
     }
 
     function test_coreDepositWallet_revertsWhenFirstDepositBelowActivationFee() public {
@@ -306,7 +356,7 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
 
         vm.prank(alice);
         vm.expectRevert(ICoreDepositWalletSim.InsufficientAmountForActivation.selector);
-        _coreDepositWallet().depositFor(recipient, 5e5, type(uint32).max);
+        _coreDepositWallet().depositFor(recipient, 5e5, HLConstants.SPOT_DEX);
 
         assertEq(PrecompileLib.spotBalance(recipient, QUOTE_TOKEN).total, 0);
         assertFalse(PrecompileLib.coreUserExists(recipient));
@@ -314,6 +364,10 @@ contract VHCForkExtensionsTest is BaseSimulatorTest {
 
     function _coreDepositWallet() internal view returns (ICoreDepositWalletSim) {
         return ICoreDepositWalletSim(HLConstants.coreDepositWallet());
+    }
+
+    function _perpBalance(address user) internal view returns (uint64 perpBalance) {
+        (, perpBalance,) = hyperCore.accounts(user);
     }
 
     function _applyFilledResult(uint64 actionId, uint128 cloid, uint64 l1Block) internal {
