@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose an improvement for hyper-evm-toolkit
+title: "[Feature] "
+labels:
+  - type:feat
+body:
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem should this feature solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the expected API and behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional, but helps decision-making
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Scope and impact
+      description: Affected area (Solidity libs, VHC simulation, TS bridge, docs)
+    validations:
+      required: true

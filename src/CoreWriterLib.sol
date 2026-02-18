@@ -42,11 +42,11 @@ library CoreWriterLib {
     }
 
     /**
-    * @dev All tokens (including USDC) will be bridged to the spot dex
-    */
+     * @dev All tokens (including USDC) will be bridged to the spot dex
+     */
     function bridgeToCore(uint64 token, uint256 evmAmount) internal {
         ICoreDepositWallet coreDepositWallet = ICoreDepositWallet(HLConstants.coreDepositWallet());
-        
+
         // Check if amount would be 0 after conversion to prevent token loss
         uint64 coreAmount = HLConversions.evmToWei(token, evmAmount);
         if (coreAmount == 0) revert CoreWriterLib__EvmAmountTooSmall(evmAmount);

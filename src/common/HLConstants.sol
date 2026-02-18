@@ -92,14 +92,10 @@ library HLConstants {
     uint8 public constant LIMIT_ORDER_TIF_GTC = 2;
     uint8 public constant LIMIT_ORDER_TIF_IOC = 3;
 
-
     /*//////////////////////////////////////////////////////////////
                         Dex Constants
     //////////////////////////////////////////////////////////////*/
     uint32 constant DEFAULT_PERP_DEX = 0;
     uint32 constant SPOT_DEX = type(uint32).max;
-
-
-
 }
 
