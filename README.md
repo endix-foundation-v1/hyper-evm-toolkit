@@ -271,6 +271,26 @@ Features:
 - Deterministic replay via command log
 - WebSocket real-time order book / trade streams
 
+#### Supported actions in Level 3 bridge
+
+The TypeScript bridge currently processes these CoreWriter action kinds:
+
+- `LIMIT_ORDER_ACTION` (spot + perp)
+- `CANCEL_ORDER_BY_OID_ACTION`
+- `CANCEL_ORDER_BY_CLOID_ACTION`
+- `SPOT_SEND_ACTION`
+
+For settlement, it uses:
+
+- `applyBridgeActionResult()` for spot orders
+- `applyPerpBridgeActionResult()` for perp orders
+
+#### Unsupported action kinds
+
+Action kinds outside the list above are marked as unsupported by the bridge. For tests that require those flows, use **Level 1** or **Level 2** simulation helpers directly.
+
+Typical examples include vault transfer, staking/delegation actions, USD class transfer, builder-fee approval, API wallet updates, and contract finalization actions.
+
 **Bridge configuration** (spot + perps):
 
 ```typescript
