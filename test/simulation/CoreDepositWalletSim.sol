@@ -19,6 +19,8 @@ contract CoreDepositWalletSim {
 
     error AmountTooLarge();
     error ZeroRecipient();
+    error SystemAddressRecipient();
+    error SelfAddressRecipient();
     error InsufficientAmountForActivation();
 
     event DepositSimulated(address indexed caller, address indexed recipient, uint64 coreAmount, uint32 destinationDex);
@@ -34,6 +36,12 @@ contract CoreDepositWalletSim {
     function _credit(address caller, address recipient, uint256 amount, uint32 destinationDex) internal {
         if (recipient == address(0)) {
             revert ZeroRecipient();
+        }
+        if (recipient == address(HLConstants.BASE_SYSTEM_ADDRESS + HLConstants.USDC_TOKEN_INDEX)) {
+            revert SystemAddressRecipient();
+        }
+        if (recipient == address(this)) {
+            revert SelfAddressRecipient();
         }
 
         _pullUsdcIfAvailable(caller, amount);
@@ -53,15 +61,25 @@ contract CoreDepositWalletSim {
             creditedAmount = coreAmount - ACTIVATION_FEE_CORE;
         }
 
-        uint64 tokenIndex = HLConstants.USDC_TOKEN_INDEX;
+        if (destinationDex == HLConstants.SPOT_DEX) {
+            uint64 tokenIndex = HLConstants.USDC_TOKEN_INDEX;
 
-        PrecompileLib.SpotBalance memory current = _hyperCore.readSpotBalance(recipient, tokenIndex);
-        uint256 nextTotal = uint256(current.total) + creditedAmount;
-        if (nextTotal > type(uint64).max) {
-            revert AmountTooLarge();
+            PrecompileLib.SpotBalance memory current = _hyperCore.readSpotBalance(recipient, tokenIndex);
+            uint256 nextTotal = uint256(current.total) + creditedAmount;
+            if (nextTotal > type(uint64).max) {
+                revert AmountTooLarge();
+            }
+
+            _hyperCore.forceSpotBalance(recipient, tokenIndex, nextTotal.toUint64());
+        } else {
+            (, uint64 currentPerpBalance,) = _hyperCore.accounts(recipient);
+            uint256 nextPerpBalance = uint256(currentPerpBalance) + creditedAmount;
+            if (nextPerpBalance > type(uint64).max) {
+                revert AmountTooLarge();
+            }
+
+            _hyperCore.forcePerpBalance(recipient, nextPerpBalance.toUint64());
         }
-
-        _hyperCore.forceSpotBalance(recipient, tokenIndex, nextTotal.toUint64());
 
         emit DepositSimulated(caller, recipient, creditedAmount, destinationDex);
     }
